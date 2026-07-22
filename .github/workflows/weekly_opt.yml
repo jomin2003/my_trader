@@ -1,24 +1,138 @@
 name: Weekly Optimization
+
+# Runs Sunday 19:00 IST = 13:30 UTC
+# Also allow manual trigger from GitHub UI
 on:
   schedule:
-    - cron: '30 13 * * SUN'   # 19:00 IST = 13:30 UTC
-  workflow_dispatch:
+    - cron: '30 13 * * SUN'
+  workflow_dispatch:                     # lets you run it manually anytime
+
+concurrency:
+  group: weekly-opt                      # prevent overlapping runs
+  cancel-in-progress: false
+
 jobs:
   optimize:
     runs-on: ubuntu-latest
+    timeout-minutes: 120                 # kill if it hangs past 2 hrs
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: {python-version: '3.11'}
-      - run: pip install -r requirements.txt
-      - run: |
-          python csv_downloader.py --mode yfinance --preset nifty50 --days 59 --out ./data
-          python param_sweep.py --mode csv --csv-dir ./data \
-              --nifty-csv ./data/NIFTY.csv --preset default \
-              --walk-forward 0.7 --out ./sweep_out
-          python live_config.py promote --sweep ./sweep_out/sweep_*.csv --force
-      - name: Push config to Gist
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Restore latest live_config from Gist
         env:
-          GITHUB_TOKEN: ${{ secrets.GH_GIST_TOKEN }}
+          GITHUB_TOKEN:   ${{ secrets.GH_GIST_TOKEN }}
           GITHUB_GIST_ID: ${{ secrets.GH_GIST_ID }}
-        run: python gist_storage.py backup live_config.json
+        run: |
+          python gist_storage.py restore || echo "no existing config, will create fresh"
+
+      - name: Download 60 days of NIFTY 50 bars (yfinance)
+        run: |
+          python csv_downloader.py \
+            --mode yfinance \
+            --preset nifty50 \
+            --days 59 \
+            --out ./data
+
+      - name: Run parameter sweep with walk-forward
+        run: |
+          python param_sweep.py \
+            --mode csv \
+            --csv-dir ./data \
+            --nifty-csv ./data/NIFTY.csv \
+            --preset default \
+            --walk-forward 0.7 \
+            --out ./sweep_out
+
+      - name: Run backtest for Monte Carlo input
+        run: |
+          python backtest_harness.py \
+            --mode csv \
+            --csv-dir ./data \
+            --nifty-csv ./data/NIFTY.csv \
+            --out ./backtest_out
+
+      - name: Run Monte Carlo permutation test
+        id: mc
+        run: |
+          LATEST_TRADES=$(ls -t ./backtest_out/trades_*.csv | head -n 1)
+          echo "Using trades file: $LATEST_TRADES"
+          python monte_carlo.py \
+            --trades "$LATEST_TRADES" \
+            --csv-dir ./data \
+            --nifty-csv ./data/NIFTY.csv \
+            --n-boot 2000 \
+            --n-perms 500 \
+            --out ./mc_out \
+            2>&1 | tee mc_output.log
+
+          # Extract p-value for expectancy_R and expose to next step
+          P_VALUE=$(grep -E "^\s*expectancy_R:" mc_output.log | head -n 1 | awk '{print $2}')
+          echo "p_value=$P_VALUE" >> $GITHUB_OUTPUT
+          echo "Extracted p-value: $P_VALUE"
+
+      - name: Promote to live_config (only if p < 0.05)
+        env:
+          GITHUB_TOKEN:   ${{ secrets.GH_GIST_TOKEN }}
+          GITHUB_GIST_ID: ${{ secrets.GH_GIST_ID }}
+        run: |
+          P_VALUE="${{ steps.mc.outputs.p_value }}"
+          echo "Monte Carlo p-value: $P_VALUE"
+
+          # Compare using python (bash floats are unreliable)
+          PASSED=$(python -c "print('yes' if float('$P_VALUE') < 0.05 else 'no')")
+          if [ "$PASSED" = "yes" ]; then
+            echo "✅ MC passed — promoting new config"
+            LATEST_SWEEP=$(ls -t ./sweep_out/sweep_*.csv | head -n 1)
+            python live_config.py promote --sweep "$LATEST_SWEEP" --force
+            python gist_storage.py backup live_config.json
+            echo "PROMOTED=true" >> $GITHUB_ENV
+          else
+            echo "ℹ️ MC did not pass (p=$P_VALUE >= 0.05) — keeping current config"
+            echo "PROMOTED=false" >> $GITHUB_ENV
+          fi
+
+      - name: Notify Telegram
+        if: always()
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID:   ${{ secrets.TG_CHAT_ID }}
+          P_VALUE:      ${{ steps.mc.outputs.p_value }}
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then
+            if [ "$PROMOTED" = "true" ]; then
+              MSG="✅ <b>Weekly opt DONE (GH Actions)</b>%0AMC p=${P_VALUE} — new config promoted to Gist"
+            else
+              MSG="ℹ️ <b>Weekly opt DONE (GH Actions)</b>%0AMC p=${P_VALUE} — no promotion (need p<0.05)"
+            fi
+          else
+            MSG="🚨 <b>Weekly opt FAILED (GH Actions)</b>%0ACheck GitHub Actions logs"
+          fi
+          curl -s "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TG_CHAT_ID}" \
+            --data-urlencode "text=${MSG}" \
+            --data-urlencode "parse_mode=HTML"
+
+      - name: Upload artifacts for debugging
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: weekly-opt-results
+          path: |
+            sweep_out/
+            mc_out/
+            backtest_out/summary_*.txt
+            mc_output.log
+          retention-days: 30
