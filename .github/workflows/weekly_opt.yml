@@ -52,7 +52,7 @@ jobs:
             --mode csv \
             --csv-dir ./data \
             --nifty-csv ./data/NIFTY.csv \
-            --preset default \
+            --preset quick \
             --walk-forward 0.7 \
             --out ./sweep_out
 
