@@ -1,52 +1,13 @@
 """
-=====================================================================
- LIVE CONFIG AUTO-LOADER for intraday_pattern_scanner_v2
----------------------------------------------------------------------
- Purpose:
-   * Reads the TOP row from a param_sweep CSV.
-   * Applies safety gates (fitness threshold, min trades, freshness).
-   * Saves the winning parameters as a versioned JSON:
-         live_config.json
-   * At scanner startup, `apply_live_config()` reads that JSON and
-     overwrites the scanner's module-level constants IN MEMORY.
-     -> No hand-editing of intraday_pattern_scanner_v2.py needed.
+LIVE CONFIG AUTO-LOADER for intraday_pattern_scanner_v2 (FIXED)
 
- Workflow:
-   1. Run param_sweep.py  -> produces sweep_<ts>.csv
-   2. Run this file in "promote" mode  -> writes live_config.json
-      python live_config.py promote --sweep ./sweep_out/sweep_XXX.csv
-   3. Live scanner auto-picks it up (see integration snippet below).
+Reads a param_sweep CSV's top row, validates it, and writes live_config.json.
+At scanner startup, apply_live_config() overwrites module-level constants.
 
- Two modes:
-   * promote  : validate + write live_config.json
-   * show     : display the currently-active config
-   * clear    : delete live_config.json (revert to hardcoded defaults)
-
- Safety gates BEFORE promotion:
-   * Config must have fitness >= --min-fitness       (default: 0.15)
-   * Config must have trades  >= --min-trades        (default: 30)
-   * If a live_config.json already exists, --force is required
-     to overwrite it (avoids accidental live config swaps).
-
- Freshness gate AT LOAD TIME (inside live scanner):
-   * live_config.json older than MAX_AGE_DAYS is REJECTED and the
-     scanner falls back to hardcoded defaults with a Telegram warning.
-     Prevents you from unknowingly trading a 3-month-old regime.
-
-=====================================================================
- INTEGRATION - add this to intraday_pattern_scanner_v2.py:
-
-     # near the top, after imports:
-     try:
-         from live_config import apply_live_config
-         apply_live_config(module_name="intraday_pattern_scanner_v2")
-     except Exception as e:
-         log.warning(f"live_config not applied: {e}")
-
- That's it. If live_config.json exists and is valid, its parameters
- override the hardcoded constants. Otherwise the scanner uses the
- built-in defaults exactly as before.
-=====================================================================
+Modes:
+  promote : validate + write live_config.json
+  show    : display current active config
+  clear   : delete live_config.json
 """
 from __future__ import annotations
 
@@ -62,13 +23,9 @@ import pandas as pd
 
 IST = ZoneInfo("Asia/Kolkata")
 
-# Default location of the live config file (next to this script)
 DEFAULT_CONFIG_PATH = Path(__file__).parent / "live_config.json"
-
-# Max age (in days) before a live config is auto-rejected
 MAX_AGE_DAYS = 30
 
-# The set of scanner constants we're allowed to override
 OVERRIDABLE_ATTRS = {
     "ATR_MULTIPLIER":       float,
     "RISK_REWARD_RATIO":    float,
@@ -77,7 +34,7 @@ OVERRIDABLE_ATTRS = {
     "MIN_TURNOVER_LAKHS":   int,
     "MIN_SL_PCT":           float,
     "MAX_SL_PCT":           float,
-    "TOP_N_RESULTS":        int,   # maps from sweep's top_per_bar
+    "TOP_N_RESULTS":        int,
 }
 
 logging.basicConfig(
@@ -88,9 +45,6 @@ logging.basicConfig(
 log = logging.getLogger("live_config")
 
 
-# =====================================================================
-# PROMOTION LOGIC
-# =====================================================================
 def _cast_value(name: str, raw):
     """Coerce a value from the CSV to the right Python type."""
     target = OVERRIDABLE_ATTRS.get(name)
@@ -112,40 +66,31 @@ def _cast_value(name: str, raw):
 
 
 def _translate_nifty_gate(gate: str) -> dict:
-    """
-    Sweep uses 'off' / 'soft' / 'strict'. Live scanner has TWO flags:
-      NIFTY_GATE_ENABLED (bool)  +  NIFTY_STRICT (bool)
-    """
     gate = str(gate).strip().lower()
     if gate == "off":    return {"NIFTY_GATE_ENABLED": False, "NIFTY_STRICT": False}
     if gate == "soft":   return {"NIFTY_GATE_ENABLED": True,  "NIFTY_STRICT": False}
     if gate == "strict": return {"NIFTY_GATE_ENABLED": True,  "NIFTY_STRICT": True}
-    return {"NIFTY_GATE_ENABLED": True, "NIFTY_STRICT": False}   # safe default
+    return {"NIFTY_GATE_ENABLED": True, "NIFTY_STRICT": False}
 
 
 def build_config_from_sweep(sweep_csv: Path, row_index: int = 0) -> dict:
-    """Read the sweep CSV and extract the requested row as a config dict."""
     df = pd.read_csv(sweep_csv)
     if df.empty:
         raise ValueError(f"Sweep CSV is empty: {sweep_csv}")
     if row_index >= len(df):
         raise ValueError(f"row_index {row_index} out of range (have {len(df)} rows)")
 
-    # Sweep CSV is already sorted by fitness desc; take row_index-th
     row = df.iloc[row_index]
 
-    params: dict = {}
+    params = {}
     for attr in OVERRIDABLE_ATTRS:
-        # top_per_bar in sweep maps to TOP_N_RESULTS in live scanner
         src = "top_per_bar" if attr == "TOP_N_RESULTS" else attr
         if src in row and pd.notna(row[src]):
             params[attr] = _cast_value(attr, row[src])
 
-    # NIFTY gate translation
     if "nifty_gate" in row and pd.notna(row["nifty_gate"]):
         params.update(_translate_nifty_gate(row["nifty_gate"]))
 
-    # Metadata for auditability
     meta = {
         "source_sweep_csv":  str(sweep_csv),
         "source_row_index":  int(row_index),
@@ -162,8 +107,7 @@ def build_config_from_sweep(sweep_csv: Path, row_index: int = 0) -> dict:
     return {"meta": meta, "params": params}
 
 
-def validate_config(cfg: dict, min_fitness: float, min_trades: int) -> tuple[bool, list[str]]:
-    """Return (is_valid, list_of_warnings)."""
+def validate_config(cfg: dict, min_fitness: float, min_trades: int):
     warnings = []
     meta = cfg.get("meta", {})
 
@@ -175,7 +119,6 @@ def validate_config(cfg: dict, min_fitness: float, min_trades: int) -> tuple[boo
     if trades is None or trades < min_trades:
         warnings.append(f"trades {trades} < required {min_trades}")
 
-    # Sanity ranges on parameters
     p = cfg.get("params", {})
     if "ATR_MULTIPLIER" in p and not (0.5 <= p["ATR_MULTIPLIER"] <= 4.0):
         warnings.append(f"ATR_MULTIPLIER {p['ATR_MULTIPLIER']} out of [0.5, 4.0]")
@@ -187,13 +130,11 @@ def validate_config(cfg: dict, min_fitness: float, min_trades: int) -> tuple[boo
         if p["MIN_SL_PCT"] >= p["MAX_SL_PCT"]:
             warnings.append(f"MIN_SL_PCT >= MAX_SL_PCT (invalid clamp)")
 
-    is_valid = len(warnings) == 0
-    return is_valid, warnings
+    return len(warnings) == 0, warnings
 
 
 def promote(sweep_csv: Path, out_path: Path, row_index: int,
             min_fitness: float, min_trades: int, force: bool) -> dict:
-    """Validate and write live_config.json."""
     log.info(f"Reading sweep row #{row_index} from {sweep_csv.name}")
     cfg = build_config_from_sweep(sweep_csv, row_index)
 
@@ -203,17 +144,13 @@ def promote(sweep_csv: Path, out_path: Path, row_index: int,
         for w in warnings:
             log.warning(f"  * {w}")
         if not force:
-            raise SystemExit(
-                "Refusing to promote invalid config. Pass --force to override "
-                "(NOT recommended for live trading)."
-            )
+            raise SystemExit("Refusing to promote invalid config. Pass --force to override.")
         log.warning("Proceeding despite validation failures (--force).")
 
     if out_path.exists() and not force:
-        # Show diff-friendly summary of what would change
         try:
             old = json.loads(out_path.read_text())
-            log.warning(f"live_config.json already exists (fitness={old['meta'].get('fitness')})")
+            log.warning(f"live_config.json exists (fitness={old['meta'].get('fitness')})")
             log.warning(f"New config fitness = {cfg['meta'].get('fitness')}")
         except Exception:
             pass
@@ -222,29 +159,24 @@ def promote(sweep_csv: Path, out_path: Path, row_index: int,
     out_path.write_text(json.dumps(cfg, indent=2, default=str))
     log.info(f"Wrote {out_path}")
 
-    # Human-readable summary
     print("\n" + "=" * 60)
     print(" LIVE CONFIG PROMOTED")
     print("=" * 60)
-    print(f"  Source:       {cfg['meta']['source_sweep_csv']}")
-    print(f"  Promoted at:  {cfg['meta']['promoted_at_human']}")
-    print(f"  Fitness:      {cfg['meta'].get('fitness')}")
-    print(f"  Trades:       {cfg['meta'].get('trades')}")
-    print(f"  Win rate:     {cfg['meta'].get('win_rate')}%")
+    print(f"  Source:        {cfg['meta']['source_sweep_csv']}")
+    print(f"  Promoted at:   {cfg['meta']['promoted_at_human']}")
+    print(f"  Fitness:       {cfg['meta'].get('fitness')}")
+    print(f"  Trades:        {cfg['meta'].get('trades')}")
+    print(f"  Win rate:      {cfg['meta'].get('win_rate')}%")
     print(f"  Profit factor: {cfg['meta'].get('profit_factor')}")
-    print(f"  Expectancy_R: {cfg['meta'].get('expectancy_R')}")
-    print(f"  Max DD:       {cfg['meta'].get('max_drawdown_pct')}%")
-    print("\n  Parameters that will override live scanner:")
+    print(f"  Expectancy_R:  {cfg['meta'].get('expectancy_R')}")
+    print(f"  Max DD:        {cfg['meta'].get('max_drawdown_pct')}%")
+    print("\n  Parameters:")
     for k, v in cfg["params"].items():
         print(f"    {k:>22}: {v}")
-    print("\n  Next: launch the live scanner. It will auto-apply this config.")
     return cfg
 
 
-# =====================================================================
-# LOAD-TIME (called from live scanner)
-# =====================================================================
-def _config_age_days(cfg: dict) -> float | None:
+def _config_age_days(cfg: dict):
     try:
         ts = datetime.fromisoformat(cfg["meta"]["promoted_at"])
         return (datetime.now(IST) - ts).total_seconds() / 86400.0
@@ -253,19 +185,7 @@ def _config_age_days(cfg: dict) -> float | None:
 
 
 def apply_live_config(module_name: str = "intraday_pattern_scanner_v2",
-                      config_path: Path | str | None = None,
-                      tg_sender=None) -> dict | None:
-    """
-    Called at scanner startup. Loads live_config.json (if any) and
-    overwrites the target module's constants IN MEMORY.
-
-    Args:
-      module_name: name of the scanner module to patch.
-      config_path: override the default location.
-      tg_sender:   optional callable(text: str) to send Telegram alerts.
-
-    Returns the applied config dict, or None if no config was applied.
-    """
+                      config_path=None, tg_sender=None):
     path = Path(config_path) if config_path else DEFAULT_CONFIG_PATH
     if not path.exists():
         log.info(f"No {path.name} found. Using hardcoded scanner defaults.")
@@ -279,17 +199,15 @@ def apply_live_config(module_name: str = "intraday_pattern_scanner_v2",
             tg_sender(f"⚠️ live_config.json unreadable: {e}. Using defaults.")
         return None
 
-    # Freshness gate
     age = _config_age_days(cfg)
     if age is not None and age > MAX_AGE_DAYS:
         msg = (f"live_config.json is {age:.0f} days old (>{MAX_AGE_DAYS}). "
-               f"Rejecting; falling back to hardcoded defaults.")
+               f"Rejecting; using hardcoded defaults.")
         log.warning(msg)
         if tg_sender:
-            tg_sender(f"⚠️ {msg}\nRe-run param_sweep + live_config promote.")
+            tg_sender(f"⚠️ {msg}")
         return None
 
-    # Locate the target module
     if module_name not in sys.modules:
         try:
             __import__(module_name)
@@ -298,14 +216,11 @@ def apply_live_config(module_name: str = "intraday_pattern_scanner_v2",
             return None
     mod = sys.modules[module_name]
 
-    # Apply overrides
     applied = {}
     skipped = []
     params = cfg.get("params", {})
     for name, raw_val in params.items():
-        # Only touch scanner-defined constants
         if not hasattr(mod, name):
-            # Special cases the live scanner may not have YET; skip gracefully
             skipped.append(name)
             continue
         val = _cast_value(name, raw_val) if name in OVERRIDABLE_ATTRS else raw_val
@@ -313,9 +228,6 @@ def apply_live_config(module_name: str = "intraday_pattern_scanner_v2",
         setattr(mod, name, val)
         applied[name] = {"old": old, "new": val}
 
-    # Also handle the two NIFTY flags (these may not exist yet in v2;
-    # setattr creates them and the scanner can pick them up if it's
-    # been wired to read them.)
     for flag in ("NIFTY_GATE_ENABLED", "NIFTY_STRICT"):
         if flag in params:
             old = getattr(mod, flag, None)
@@ -340,12 +252,9 @@ def apply_live_config(module_name: str = "intraday_pattern_scanner_v2",
     return cfg
 
 
-# =====================================================================
-# CLI
-# =====================================================================
 def _cmd_show(path: Path):
     if not path.exists():
-        print(f"No live config at {path}. (Scanner will use hardcoded defaults.)")
+        print(f"No live config at {path}. (Scanner uses hardcoded defaults.)")
         return
     cfg = json.loads(path.read_text())
     age = _config_age_days(cfg)
@@ -360,13 +269,13 @@ def _cmd_show(path: Path):
     for k, v in cfg.get("params", {}).items():
         print(f"  {k:>22}: {v}")
     if age is not None and age > MAX_AGE_DAYS:
-        print(f"\n⚠️  Config is older than {MAX_AGE_DAYS} days — scanner will REJECT it.")
+        print(f"\n⚠️  Config older than {MAX_AGE_DAYS} days — scanner will REJECT it.")
 
 
 def _cmd_clear(path: Path):
     if path.exists():
         path.unlink()
-        print(f"Deleted {path}. Scanner will use hardcoded defaults.")
+        print(f"Deleted {path}. Scanner uses hardcoded defaults.")
     else:
         print("Nothing to delete.")
 
@@ -375,26 +284,18 @@ def main():
     ap = argparse.ArgumentParser(description="Live config manager for scanner v2")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    # promote
     p = sub.add_parser("promote", help="Promote a sweep row to live_config.json")
-    p.add_argument("--sweep", required=True, help="Path to sweep_XXX.csv")
-    p.add_argument("--row", type=int, default=0,
-                   help="Row index in sweep CSV (0 = top). Default: 0")
-    p.add_argument("--out", type=str, default=str(DEFAULT_CONFIG_PATH),
-                   help="Output path (default: live_config.json next to this script)")
-    p.add_argument("--min-fitness", type=float, default=0.15,
-                   help="Reject if fitness < this. Default: 0.15")
-    p.add_argument("--min-trades", type=int, default=30,
-                   help="Reject if trades < this. Default: 30")
-    p.add_argument("--force", action="store_true",
-                   help="Overwrite existing config AND skip validation")
+    p.add_argument("--sweep", required=True)
+    p.add_argument("--row", type=int, default=0)
+    p.add_argument("--out", type=str, default=str(DEFAULT_CONFIG_PATH))
+    p.add_argument("--min-fitness", type=float, default=0.15)
+    p.add_argument("--min-trades", type=int, default=30)
+    p.add_argument("--force", action="store_true")
 
-    # show
-    s = sub.add_parser("show", help="Show current live config")
+    s = sub.add_parser("show")
     s.add_argument("--path", type=str, default=str(DEFAULT_CONFIG_PATH))
 
-    # clear
-    c = sub.add_parser("clear", help="Delete live_config.json (revert to defaults)")
+    c = sub.add_parser("clear")
     c.add_argument("--path", type=str, default=str(DEFAULT_CONFIG_PATH))
 
     args = ap.parse_args()

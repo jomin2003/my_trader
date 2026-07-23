@@ -1,34 +1,23 @@
 """
-=====================================================================
- FLASK WEB SERVICE for Render FREE TIER + external cron
----------------------------------------------------------------------
- Architecture:
-   * Flask app exposes HTTP endpoints (Render free tier requires this)
-   * External cron (cron-job.org) hits endpoints at market-timed intervals
-   * /healthz pinged every 5 min => Render never spins down
-   * Config persistence via GitHub Gist (ephemeral disk-safe)
-   * Dhan token refresh on every cold start (no disk cache needed)
+FLASK WEB SERVICE for Render FREE TIER + external cron (FIXED)
 
- Endpoints:
-   GET  /                    - status page (human-readable)
-   GET  /healthz             - keep-alive ping (returns 200 fast)
-   POST /trigger/refresh     - refresh Dhan token
-   POST /trigger/scan        - one scan+act pass (called every 5 min in mkt hrs)
-   POST /trigger/oco         - poll open positions for OCO cleanup
-   POST /trigger/download    - append today's bars (called after mkt close)
-   POST /trigger/weekly      - full re-optimization (called Sunday)
-   POST /trigger/promote     - promote latest sweep to live_config
+Endpoints:
+  GET  /                    - status page
+  GET  /healthz             - keep-alive ping
+  GET  /status              - JSON state dump
+  POST /trigger/refresh     - refresh Dhan token
+  POST /trigger/scan        - one scan+act pass (every 5 min in mkt hrs)
+  POST /trigger/oco         - poll open positions
+  POST /trigger/download    - append today's bars + refresh OB data
+  POST /trigger/promote     - manual promote of latest sweep
 
- Auth: all /trigger/* endpoints require header X-Cron-Secret matching
-       CRON_SECRET env var (protects against random internet hits).
+Auth: /trigger/* endpoints require X-Cron-Secret header or ?secret= query param
+matching CRON_SECRET env var.
 
- Environment variables (Render dashboard):
-   DHAN_CLIENT_ID, DHAN_PIN, DHAN_TOTP_SECRET, DHAN_ACCESS_TOKEN
-   TG_BOT_TOKEN, TG_CHAT_ID
-   CRON_SECRET             (any random string; also set on cron-job.org)
-   GITHUB_TOKEN            (personal access token with gist scope)
-   GITHUB_GIST_ID          (id of your private gist; created once manually)
-=====================================================================
+Environment variables (Render dashboard):
+  DHAN_CLIENT_ID, DHAN_PIN, DHAN_TOTP_SECRET, DHAN_ACCESS_TOKEN
+  TG_BOT_TOKEN, TG_CHAT_ID
+  CRON_SECRET, GITHUB_TOKEN, GITHUB_GIST_ID
 """
 from __future__ import annotations
 
@@ -48,15 +37,13 @@ from zoneinfo import ZoneInfo
 import requests
 from flask import Flask, jsonify, request
 
-# Ensure local pipeline modules are importable
 BASE_DIR = Path(__file__).parent
 sys.path.insert(0, str(BASE_DIR))
 
-# ---------------------------------------------------------------------
 IST = ZoneInfo("Asia/Kolkata")
-MARKET_OPEN  = dtime(9, 15)
-MARKET_CLOSE = dtime(15, 30)
-SCAN_START   = dtime(9, 30)
+MARKET_OPEN    = dtime(9, 15)
+MARKET_CLOSE   = dtime(15, 30)
+SCAN_START     = dtime(9, 30)
 NO_ENTRY_AFTER = dtime(14, 30)
 
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
@@ -79,18 +66,15 @@ log = logging.getLogger("app")
 
 app = Flask(__name__)
 
-# ---------------------------------------------------------------------
-# In-memory state (resets on cold start; that's OK)
-# ---------------------------------------------------------------------
 STATE = {
-    "boot_time_ist":     datetime.now(IST).isoformat(),
-    "last_scan":         None,
-    "last_download":     None,
+    "boot_time_ist":      datetime.now(IST).isoformat(),
+    "last_scan":          None,
+    "last_download":      None,
     "last_token_refresh": None,
-    "scans_today":       0,
-    "signals_today":     0,
-    "orders_today":      0,
-    "errors_last_10":    [],
+    "scans_today":        0,
+    "signals_today":      0,
+    "orders_today":       0,
+    "errors_last_10":     [],
 }
 
 
@@ -117,14 +101,11 @@ def tg_send(text: str, silent: bool = False):
         pass
 
 
-# ---------------------------------------------------------------------
-# AUTH DECORATOR
-# ---------------------------------------------------------------------
 def require_cron_secret(f):
     @wraps(f)
     def _wrap(*a, **kw):
         if not CRON_SECRET:
-            return jsonify({"error": "CRON_SECRET not configured"}), 500
+            return jsonify({"error": "CRON_SECRET not configured on server"}), 500
         supplied = request.headers.get("X-Cron-Secret") or request.args.get("secret")
         if supplied != CRON_SECRET:
             return jsonify({"error": "unauthorized"}), 401
@@ -132,16 +113,12 @@ def require_cron_secret(f):
     return _wrap
 
 
-# ---------------------------------------------------------------------
-# BOOT: restore config from Gist + refresh token
-# ---------------------------------------------------------------------
 def boot_restore():
     """Called once at process start. Never raises."""
     log.info("=" * 50)
     log.info(f"BOOT at {now_ist().isoformat()}")
     log.info("=" * 50)
 
-    # 1. Restore live_config.json from GitHub Gist
     try:
         from gist_storage import restore_from_gist
         n = restore_from_gist(BASE_DIR)
@@ -149,7 +126,6 @@ def boot_restore():
     except Exception as e:
         log.warning(f"Gist restore skipped: {e}")
 
-    # 2. Refresh Dhan token
     try:
         from dhan_token_manager import ensure_valid_token
         tok = ensure_valid_token(force=False)
@@ -163,9 +139,6 @@ def boot_restore():
     tg_send(f"🟢 App booted on Render at {now_ist():%H:%M IST}", silent=True)
 
 
-# ---------------------------------------------------------------------
-# DHAN CLIENT (lazy singleton)
-# ---------------------------------------------------------------------
 _DHAN = None
 _DHAN_LOCK = threading.Lock()
 
@@ -182,15 +155,34 @@ def get_dhan():
 
 
 def reset_dhan():
-    """Call after token refresh so client uses fresh token."""
     global _DHAN
     with _DHAN_LOCK:
         _DHAN = None
 
 
-# ---------------------------------------------------------------------
+def _run_module(script: str, args: list, timeout: int) -> int:
+    """Run a python script as subprocess. Returns exit code."""
+    log.info(f"Running: python {script} {' '.join(args)}")
+    try:
+        p = subprocess.run(
+            [sys.executable, script, *args],
+            cwd=str(BASE_DIR), capture_output=True, text=True, timeout=timeout,
+            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+        )
+        if p.returncode != 0:
+            log.error(f"{script} rc={p.returncode}\nSTDERR:\n{p.stderr[-800:]}")
+        return p.returncode
+    except subprocess.TimeoutExpired:
+        log.error(f"{script} TIMEOUT after {timeout}s")
+        return -1
+    except Exception as e:
+        log.error(f"{script} crashed: {e}")
+        return -2
+
+
+# =====================================================================
 # ENDPOINTS
-# ---------------------------------------------------------------------
+# =====================================================================
 @app.route("/")
 def index():
     return jsonify({
@@ -205,18 +197,30 @@ def index():
 
 @app.route("/healthz")
 def healthz():
-    """Ultra-fast keep-alive endpoint. External cron hits this every 5 min."""
     return "ok", 200
 
 
 @app.route("/status")
 def status():
     live_config_exists = (BASE_DIR / "live_config.json").exists()
+    ob_data_exists     = (BASE_DIR / "ob_data.csv").exists()
+
+    token_hours_left = None
+    try:
+        from dhan_token_manager import load_token
+        tok = load_token()
+        if tok:
+            token_hours_left = round(tok.hours_left, 2)
+    except Exception:
+        pass
+
     return jsonify({
         "time_ist":           now_ist().isoformat(),
         "in_market_hours":    MARKET_OPEN <= now_ist().time() <= MARKET_CLOSE,
         "in_entry_window":    SCAN_START <= now_ist().time() <= NO_ENTRY_AFTER,
         "live_config_active": live_config_exists,
+        "ob_data_active":     ob_data_exists,
+        "token_hours_left":   token_hours_left,
         "state":              STATE,
     })
 
@@ -224,29 +228,36 @@ def status():
 @app.route("/trigger/refresh", methods=["POST", "GET"])
 @require_cron_secret
 def trigger_refresh():
+    """Refresh Dhan token via TOTP."""
     try:
         from dhan_token_manager import ensure_valid_token
-        tok = ensure_valid_token(force=request.args.get("force") == "1")
+        force = request.args.get("force") == "1"
+        tok = ensure_valid_token(force=force)
         reset_dhan()
         STATE["last_token_refresh"] = now_ist().isoformat()
-        return jsonify({"ok": True, "token_prefix": tok[:10] + "..." if tok else None})
+        return jsonify({
+            "ok": True,
+            "token_prefix": tok[:10] + "..." if tok else None,
+            "refreshed_at": STATE["last_token_refresh"],
+        })
     except Exception as e:
+        tb = traceback.format_exc()[-500:]
         _record_error(f"refresh: {e}")
         tg_send(f"⚠️ Token refresh FAILED: {e}")
-        return jsonify({"ok": False, "error": str(e)}), 500
+        return jsonify({"ok": False, "error": str(e), "traceback": tb}), 500
 
 
 @app.route("/trigger/scan", methods=["POST", "GET"])
 @require_cron_secret
 def trigger_scan():
-    """One scan+act pass. External cron hits this every 5 min during market hours."""
+    """One scan+act pass. Cron every 5 min in market hours."""
     try:
         t = now_ist().time()
         if not (MARKET_OPEN <= t <= MARKET_CLOSE):
-            return jsonify({"skipped": "outside market hours"})
+            return jsonify({"skipped": "outside market hours", "time_ist": t.isoformat()})
 
         import intraday_pattern_scanner_v2 as scn
-        # Apply live config if present
+
         try:
             from live_config import apply_live_config
             apply_live_config(module_name="intraday_pattern_scanner_v2", tg_sender=tg_send)
@@ -265,23 +276,25 @@ def trigger_scan():
 
         if ranked is not None and not ranked.empty and SCAN_START <= t <= NO_ENTRY_AFTER:
             scn.act_on_signals(dhan, ranked)
-            # rough order count: highest-score signals that would trade
             orders = int((ranked["score"] >= scn.MIN_SCORE_TO_TRADE).sum())
             STATE["orders_today"] += orders
 
-        # Always poll OCO regardless
         try:
             scn.monitor_oco(dhan)
         except Exception as e:
             log.debug(f"OCO monitor issue: {e}")
 
-        return jsonify({"ok": True, "signals": signals_count,
-                        "scans_today": STATE["scans_today"]})
+        return jsonify({
+            "ok": True,
+            "signals": signals_count,
+            "scans_today": STATE["scans_today"],
+            "time_ist": now_ist().isoformat(),
+        })
     except Exception as e:
         tb = traceback.format_exc()[-500:]
         _record_error(f"scan: {e}")
-        tg_send(f"⚠️ Scan error: <code>{tb}</code>")
-        return jsonify({"ok": False, "error": str(e)}), 500
+        tg_send(f"⚠️ Scan error: <code>{str(e)[:200]}</code>")
+        return jsonify({"ok": False, "error": str(e), "traceback": tb}), 500
 
 
 @app.route("/trigger/oco", methods=["POST", "GET"])
@@ -289,9 +302,13 @@ def trigger_scan():
 def trigger_oco():
     """OCO cleanup only (lighter than full scan)."""
     try:
+        t = now_ist().time()
+        if not (MARKET_OPEN <= t <= MARKET_CLOSE):
+            return jsonify({"skipped": "outside market hours"})
+
         import intraday_pattern_scanner_v2 as scn
         scn.monitor_oco(get_dhan())
-        return jsonify({"ok": True})
+        return jsonify({"ok": True, "time_ist": now_ist().isoformat()})
     except Exception as e:
         _record_error(f"oco: {e}")
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -300,70 +317,42 @@ def trigger_oco():
 @app.route("/trigger/download", methods=["POST", "GET"])
 @require_cron_secret
 def trigger_download():
-    """Append today's bars via Dhan. Runs after market close."""
+    """Append today's bars + refresh OB zones. Runs after market close."""
     try:
-        rc = _run_module("csv_downloader.py",
-                         ["--mode", "dhan", "--preset", "nifty50",
-                          "--out", str(DATA_DIR)],
-                         timeout=600)
+        rc1 = _run_module("csv_downloader.py",
+                          ["--mode", "dhan", "--preset", "nifty50",
+                           "--out", str(DATA_DIR)],
+                          timeout=600)
+
+        rc2 = _run_module("precompute_order_blocks.py",
+                          ["--csv-dir", str(DATA_DIR),
+                           "--out", str(BASE_DIR / "ob_data.csv")],
+                          timeout=300)
+
         STATE["last_download"] = now_ist().isoformat()
-        # Push updated CSVs to Gist? Skipped - too much data. Rebuild on cold start.
-        return jsonify({"ok": rc == 0, "rc": rc})
+
+        overall_ok = (rc1 == 0 and rc2 == 0)
+        result = {
+            "ok": overall_ok,
+            "download_rc": rc1,
+            "ob_precompute_rc": rc2,
+            "time_ist": now_ist().isoformat(),
+        }
+
+        if not overall_ok:
+            tg_send(f"⚠️ Post-market data pipeline failed: dl_rc={rc1}, ob_rc={rc2}")
+
+        return jsonify(result)
     except Exception as e:
         _record_error(f"download: {e}")
+        tg_send(f"⚠️ Download endpoint crashed: {e}")
         return jsonify({"ok": False, "error": str(e)}), 500
-
-
-@app.route("/trigger/weekly", methods=["POST", "GET"])
-@require_cron_secret
-def trigger_weekly():
-    """
-    Sunday weekly optimization.
-    WARNING: On free tier (0.1 CPU, 512 MB) this may take 30+ min and can OOM.
-    Consider running weekly opt on GitHub Actions instead — see README.
-    """
-    def _bg():
-        try:
-            tg_send("🔧 Weekly optimization started (Render free tier — slow)")
-            for cmd in [
-                ("csv_downloader.py",  ["--mode", "yfinance", "--preset", "nifty50",
-                                        "--days", "59", "--out", str(DATA_DIR)], 1800),
-                ("param_sweep.py",     ["--mode", "csv", "--csv-dir", str(DATA_DIR),
-                                        "--nifty-csv", str(DATA_DIR / "NIFTY.csv"),
-                                        "--preset", "quick",   # quick to fit RAM/CPU
-                                        "--walk-forward", "0.7",
-                                        "--out", str(SW_DIR)], 5400),
-                ("backtest_harness.py",["--mode", "csv", "--csv-dir", str(DATA_DIR),
-                                        "--nifty-csv", str(DATA_DIR / "NIFTY.csv"),
-                                        "--out", str(BT_DIR)], 1800),
-            ]:
-                rc = _run_module(cmd[0], cmd[1], timeout=cmd[2])
-                if rc != 0:
-                    tg_send(f"⚠️ Weekly step failed: {cmd[0]} rc={rc}")
-                    return
-            # Auto-promote (assumes sweep did walk-forward validation)
-            sweeps = sorted(SW_DIR.glob("sweep_*.csv"), key=lambda p: p.stat().st_mtime)
-            if sweeps:
-                _run_module("live_config.py", ["promote", "--sweep", str(sweeps[-1]),
-                                                "--force"], timeout=60)
-                # Push live_config to Gist for persistence
-                try:
-                    from gist_storage import backup_to_gist
-                    backup_to_gist(BASE_DIR, files=["live_config.json"])
-                    tg_send("✅ Weekly opt done. live_config promoted + backed up to Gist.")
-                except Exception as e:
-                    tg_send(f"✅ Weekly opt done but Gist backup failed: {e}")
-        except Exception as e:
-            tg_send(f"🚨 Weekly opt crashed: {e}")
-
-    threading.Thread(target=_bg, daemon=True).start()
-    return jsonify({"ok": True, "note": "started in background"})
 
 
 @app.route("/trigger/promote", methods=["POST", "GET"])
 @require_cron_secret
 def trigger_promote():
-    """Manually promote the latest sweep result to live config."""
+    """Manually promote latest sweep to live config + back up to Gist."""
     try:
         sweeps = sorted(SW_DIR.glob("sweep_*.csv"), key=lambda p: p.stat().st_mtime)
         if not sweeps:
@@ -372,37 +361,22 @@ def trigger_promote():
                          ["promote", "--sweep", str(sweeps[-1]), "--force"],
                          timeout=60)
         if rc == 0:
-            from gist_storage import backup_to_gist
-            backup_to_gist(BASE_DIR, files=["live_config.json"])
-        return jsonify({"ok": rc == 0})
+            try:
+                from gist_storage import backup_to_gist
+                backup_to_gist(BASE_DIR, files=["live_config.json"])
+            except Exception as e:
+                log.warning(f"Gist backup failed: {e}")
+        return jsonify({"ok": rc == 0, "promoted_from": sweeps[-1].name})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
-# ---------------------------------------------------------------------
-def _run_module(script: str, args: list[str], timeout: int) -> int:
-    log.info(f"Running: python {script} {' '.join(args)}")
-    try:
-        p = subprocess.run(
-            [sys.executable, script, *args],
-            cwd=str(BASE_DIR), capture_output=True, text=True, timeout=timeout,
-            env={**os.environ, "PYTHONUNBUFFERED": "1"},
-        )
-        if p.returncode != 0:
-            log.error(f"{script} rc={p.returncode}\n{p.stderr[-800:]}")
-        return p.returncode
-    except subprocess.TimeoutExpired:
-        log.error(f"{script} TIMEOUT")
-        return -1
-
-
-# ---------------------------------------------------------------------
+# =====================================================================
 # BOOT
-# ---------------------------------------------------------------------
+# =====================================================================
 boot_restore()
 
 
 if __name__ == "__main__":
-    # Local dev only. On Render, gunicorn is used (see Procfile).
     port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port, debug=False)
