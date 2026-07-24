@@ -1,14 +1,20 @@
 """
 =====================================================================
- DHAN INTRADAY SCANNER + AUTO-TRADER + TELEGRAM  (v2 + OB Shorts)
+ DHAN INTRADAY SCANNER + AUTO-TRADER + TELEGRAM  (v2 + 3 STRATEGIES)
 ---------------------------------------------------------------------
- Wired for OB Shorts paper trading (2026-07-22):
-   * Backtest: 50 trades, 52% WR, Exp_R +0.271, PF 1.34, RR 1:4
-   * Monte Carlo p<0.0001 on Exp_R, PnL, PF
-   * PAPER TRADING ONLY — AUTO_TRADE_ENABLED must stay False
+ Runs 3 strategies together via multi_strategy_live.py:
+   * OB SHORTS  (validated p<0.0001) - shooting star at bear OB zones
+   * ORB        - opening range breakout, both directions
+   * GAP-FILL   - fade 1-3% gaps back to prev close
 
- Strategy override happens at module load time (before run() is
- called), so subprocess launches always get the OB Shorts logic.
+ Each signal is tagged by strategy in Telegram alerts.
+
+ Requires alongside this file:
+   multi_strategy_live.py
+   ob_data.csv       (from precompute_order_blocks.py)
+   gap_data.csv      (from precompute_gapfill.py)
+
+ AUTO_TRADE_ENABLED = False (paper trading). Keep it False for 2 weeks.
 =====================================================================
 """
 from __future__ import annotations
@@ -30,7 +36,7 @@ import requests
 try:
     from dhanhq import DhanContext, dhanhq
     DHAN_SDK_V2 = True
-except ImportError:  # pragma: no cover
+except ImportError:
     from dhanhq import dhanhq              # type: ignore
     DhanContext = None                     # type: ignore
     DHAN_SDK_V2 = False
@@ -46,9 +52,9 @@ TELEGRAM_CHAT_ID   = os.getenv("TG_CHAT_ID",   "YOUR_TELEGRAM_CHAT_ID")
 TELEGRAM_ENABLED   = True
 
 # ---- Auto-Trading ----
-AUTO_TRADE_ENABLED    = False   # KEEP FALSE for paper trading (2 weeks min)
-MIN_SCORE_TO_TRADE    = 6       # Lowered from 7 for OB Shorts (validated config)
-RISK_REWARD_RATIO     = 4.0     # OB Shorts winning config
+AUTO_TRADE_ENABLED    = False   # KEEP FALSE for paper trading
+MIN_SCORE_TO_TRADE    = 6       # multi-strategy signals score 6-8
+RISK_REWARD_RATIO     = 2.0     # blended default across 3 strategies
 MAX_RISK_PER_TRADE    = 500     # ₹
 MAX_CAPITAL_PER_TRADE = 25000   # ₹
 MAX_OPEN_POSITIONS    = 5
@@ -57,13 +63,13 @@ ATR_MULTIPLIER        = 1.5
 FALLBACK_SL_PERCENT   = 0.005
 MIN_SL_PCT            = 0.003
 MAX_SL_PCT            = 0.015
-REQUIRE_CONFIRMATION  = False   # OB Shorts doesn't need candlestick confirmation
+REQUIRE_CONFIRMATION  = False   # multi-strategy handles its own confirmation
 
 # ---- Universe / data ----
 USE_FNO_UNIVERSE_ONLY = True
 MAX_STOCKS            = 180
 CANDLE_INTERVAL_MIN   = 5
-MIN_CANDLES_NEEDED    = 5       # Lowered for OB Shorts (was 20 for candlesticks)
+MIN_CANDLES_NEEDED    = 4        # multi-strategy needs few bars
 TOP_N_RESULTS         = 20
 MIN_TURNOVER_LAKHS    = 25
 
@@ -179,17 +185,15 @@ def tg_send(text: str, silent: bool = False) -> None:
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         requests.post(url, json={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_notification": silent,
+            "chat_id": TELEGRAM_CHAT_ID, "text": text,
+            "parse_mode": "HTML", "disable_notification": silent,
         }, timeout=5)
     except Exception as e:
         log.debug(f"Telegram send failed: {e}")
 
 
 # =====================================================================
-# 1. UNIVERSE
+# UNIVERSE
 # =====================================================================
 def load_intraday_universe() -> pd.DataFrame:
     log.info("Downloading Dhan instrument master ...")
@@ -239,7 +243,7 @@ def load_intraday_universe() -> pd.DataFrame:
 
 
 # =====================================================================
-# 2. HISTORICAL DATA
+# HISTORICAL DATA
 # =====================================================================
 def fetch_intraday(dhan, security_id: str) -> pd.DataFrame | None:
     today = now_ist().strftime("%Y-%m-%d")
@@ -274,10 +278,8 @@ def fetch_intraday(dhan, security_id: str) -> pd.DataFrame | None:
         return None
 
     df = pd.DataFrame({
-        "open":   data["open"],
-        "high":   data["high"],
-        "low":    data["low"],
-        "close":  data["close"],
+        "open":   data["open"], "high": data["high"],
+        "low":    data["low"],  "close": data["close"],
         "volume": data.get("volume", [0] * len(data["open"])),
     })
 
@@ -298,7 +300,7 @@ def fetch_intraday(dhan, security_id: str) -> pd.DataFrame | None:
 
 
 # =====================================================================
-# 3. INDICATORS
+# INDICATORS (used by multi_strategy_live)
 # =====================================================================
 def wilder_atr(df: pd.DataFrame, period: int = 14) -> float | None:
     if len(df) < period + 1:
@@ -333,69 +335,34 @@ def ema(series: pd.Series, span: int) -> float | None:
 
 
 # =====================================================================
-# 4. DEFAULT PATTERN DETECTION (fallback — will be replaced by ob_live)
+# DEFAULT DETECTORS (fallback if multi_strategy_live not present)
 # =====================================================================
-def _body(o, c):          return abs(c - o)
-def _range(h, l):         return max(h - l, 1e-9)
-def _upper_wick(o, h, c): return h - max(o, c)
-def _lower_wick(o, l, c): return min(o, c) - l
-
-
 def detect_patterns(df: pd.DataFrame) -> list[tuple[int, str, int]]:
-    """Default candlestick detector (backup if ob_live not loaded)."""
-    if len(df) < 3:
-        return []
-    o2, h2, l2, c2 = df["open"].iloc[-1], df["high"].iloc[-1], df["low"].iloc[-1], df["close"].iloc[-1]
-    hits = []
-    body2 = _body(o2, c2)
-    rng2 = _range(h2, l2)
-    up2 = _upper_wick(o2, h2, c2)
-    lo2 = _lower_wick(o2, l2, c2)
-    if body2 > 0 and lo2 >= 2 * body2 and up2 <= 0.3 * body2 and body2 / rng2 <= 0.35:
-        hits.append((+1, "Hammer", 4))
-    if body2 > 0 and up2 >= 2 * body2 and lo2 <= 0.3 * body2 and body2 / rng2 <= 0.35:
-        hits.append((-1, "Shooting Star", 4))
-    return hits
+    return []   # replaced at import time below
 
 
-def score_signals(symbol: str, security_id: str, df: pd.DataFrame,
-                  hits: list[tuple[int, str, int]]) -> list[dict]:
-    """Default scorer (backup if ob_live not loaded)."""
-    if not hits:
-        return []
-    close_now = float(df["close"].iloc[-1])
-    return [{
-        "symbol": symbol, "security_id": security_id,
-        "pattern": name, "signal": "BUY" if s > 0 else "SELL",
-        "direction": s, "strength": strength, "vol_ratio": 1.0,
-        "score": strength, "price": round(close_now, 2),
-        "atr": None, "vwap": None,
-        "time": df["ts"].iloc[-1].strftime("%H:%M") if "ts" in df else "",
-    } for s, name, strength in hits]
+def score_signals(symbol, security_id, df, hits) -> list[dict]:
+    return []   # replaced at import time below
 
 
 # =====================================================================
-# STRATEGY OVERRIDE — MODULE-LEVEL, RUNS AT IMPORT TIME
+# STRATEGY OVERRIDE — 3 STRATEGIES (module-level, runs at import)
 # =====================================================================
-# OB Shorts strategy (validated 2026-07-22):
-#   Config: RR=1:4, MIN_SCORE=6, SHORTS ONLY
-#   Results: 52% WR, +0.271 Exp_R, PF 1.34, 50 trades
-#   Monte Carlo: p<0.0001 on Expectancy_R, PnL, PF
-# PAPER TRADING ONLY — AUTO_TRADE_ENABLED must stay False for 2 weeks
+# OB Shorts + ORB + Gap-Fill, each signal tagged by strategy.
+# PAPER TRADING ONLY — AUTO_TRADE_ENABLED must stay False.
 try:
-    import ob_live
-    detect_patterns = ob_live.detect_patterns
-    score_signals   = ob_live.score_signals
-    log.info("[SCANNER] OB Shorts strategy ACTIVE (paper trade mode)")
+    import multi_strategy_live
+    detect_patterns = multi_strategy_live.detect_patterns
+    score_signals   = multi_strategy_live.score_signals
+    log.info("[SCANNER] Multi-strategy active: OB Shorts + ORB + Gap-Fill")
 except ImportError as e:
-    log.warning(f"[SCANNER] ob_live not found ({e}) — using default candlesticks")
+    log.warning(f"[SCANNER] multi_strategy_live not found ({e}) — no signals will fire")
 except Exception as e:
-    log.error(f"[SCANNER] OB Shorts wire-in failed: {e}")
-    log.warning("[SCANNER] Falling back to default candlestick engine")
+    log.error(f"[SCANNER] multi wire-in failed: {e}")
 
 
 # =====================================================================
-# 5. TRADE MANAGEMENT
+# TRADE MANAGEMENT
 # =====================================================================
 _OPEN_POSITIONS: dict[str, dict] = {}
 _TRADED_TODAY:  set[str]        = set()
@@ -406,24 +373,19 @@ def compute_sl_target(entry: float, direction: int, atr_val: float | None):
         sl_dist = ATR_MULTIPLIER * atr_val
     else:
         sl_dist = FALLBACK_SL_PERCENT * entry
-
     sl_dist = max(MIN_SL_PCT * entry, min(sl_dist, MAX_SL_PCT * entry))
-
     if direction > 0:
-        sl     = round(entry - sl_dist, 2)
-        target = round(entry + RISK_REWARD_RATIO * sl_dist, 2)
+        sl = round(entry - sl_dist, 2); target = round(entry + RISK_REWARD_RATIO * sl_dist, 2)
     else:
-        sl     = round(entry + sl_dist, 2)
-        target = round(entry - RISK_REWARD_RATIO * sl_dist, 2)
+        sl = round(entry + sl_dist, 2); target = round(entry - RISK_REWARD_RATIO * sl_dist, 2)
     return sl, target, sl_dist
 
 
 def compute_quantity(entry: float, sl_dist: float) -> int:
     if sl_dist <= 0 or entry <= 0:
         return 0
-    qty_by_risk    = int(MAX_RISK_PER_TRADE // sl_dist)
-    qty_by_capital = int(MAX_CAPITAL_PER_TRADE // entry)
-    return max(0, min(qty_by_risk, qty_by_capital))
+    return max(0, min(int(MAX_RISK_PER_TRADE // sl_dist),
+                      int(MAX_CAPITAL_PER_TRADE // entry)))
 
 
 def _order_id(resp) -> str | None:
@@ -460,6 +422,7 @@ def place_bracket_orders(dhan, sig: dict) -> None:
     entry_px = sig["price"]
     dirn     = sig["direction"]
     atr_val  = sig.get("atr")
+    strat    = sig.get("strategy", "?")
 
     if symbol in _OPEN_POSITIONS or symbol in _TRADED_TODAY:
         return
@@ -477,14 +440,14 @@ def place_bracket_orders(dhan, sig: dict) -> None:
     exit_side = "SELL" if dirn > 0 else "BUY"
 
     tg_txt = (
-        f"🎯 <b>ORDER ATTEMPT</b> [{sig['pattern']}]\n"
+        f"🎯 <b>ORDER ATTEMPT</b> [{strat}] {sig['pattern']}\n"
         f"<b>{symbol}</b> {side} ×{qty}\n"
         f"Entry~₹{entry_px}  SL ₹{sl_px}  TGT ₹{tgt_px} (1:{RISK_REWARD_RATIO})\n"
         f"Score {sig['score']} | Vol×{sig['vol_ratio']}"
     )
 
     if not AUTO_TRADE_ENABLED:
-        log.info(f"[DRY-RUN] {side} {qty} {symbol} @{entry_px} SL {sl_px} TGT {tgt_px}")
+        log.info(f"[DRY-RUN][{strat}] {side} {qty} {symbol} @{entry_px} SL {sl_px} TGT {tgt_px}")
         tg_send("🧪 <b>DRY-RUN</b>\n" + tg_txt)
         _TRADED_TODAY.add(symbol)
         return
@@ -496,13 +459,9 @@ def place_bracket_orders(dhan, sig: dict) -> None:
         quantity=qty,
         product_type=getattr(dhan, "INTRA", "INTRADAY"),
     )
-
     try:
-        entry_resp = dhan.place_order(
-            **order_kw,
-            order_type=getattr(dhan, "MARKET", "MARKET"),
-            price=0,
-        )
+        entry_resp = dhan.place_order(**order_kw,
+                                      order_type=getattr(dhan, "MARKET", "MARKET"), price=0)
     except Exception as e:
         log.error(f"[{symbol}] entry error: {e}")
         tg_send(f"❌ Entry error {symbol}: {e}")
@@ -522,27 +481,19 @@ def place_bracket_orders(dhan, sig: dict) -> None:
         quantity=qty,
         product_type=getattr(dhan, "INTRA", "INTRADAY"),
     )
-
     sl_id = None
     try:
-        sl_resp = dhan.place_order(
-            **exit_kw,
-            order_type=getattr(dhan, "SLM", "STOP_LOSS_MARKET"),
-            price=0,
-            trigger_price=sl_px,
-        )
+        sl_resp = dhan.place_order(**exit_kw,
+                                   order_type=getattr(dhan, "SLM", "STOP_LOSS_MARKET"),
+                                   price=0, trigger_price=sl_px)
         sl_id = _order_id(sl_resp)
     except Exception as e:
         log.error(f"[{symbol}] SL fail: {e}")
         tg_send(f"⚠️ SL failed {symbol}: {e}")
-
     tgt_id = None
     try:
-        tgt_resp = dhan.place_order(
-            **exit_kw,
-            order_type=getattr(dhan, "LIMIT", "LIMIT"),
-            price=tgt_px,
-        )
+        tgt_resp = dhan.place_order(**exit_kw,
+                                    order_type=getattr(dhan, "LIMIT", "LIMIT"), price=tgt_px)
         tgt_id = _order_id(tgt_resp)
     except Exception as e:
         log.error(f"[{symbol}] TGT fail: {e}")
@@ -551,12 +502,11 @@ def place_bracket_orders(dhan, sig: dict) -> None:
     _OPEN_POSITIONS[symbol] = {
         "entry_id": entry_id, "sl_id": sl_id, "tgt_id": tgt_id,
         "qty": qty, "entry": entry_px, "sl": sl_px, "target": tgt_px,
-        "side": side, "opened_at": now_ist(),
+        "side": side, "opened_at": now_ist(), "strategy": strat,
     }
     _TRADED_TODAY.add(symbol)
-
     tg_send(
-        f"✅ <b>ORDER PLACED</b> [{sig['pattern']}]\n"
+        f"✅ <b>ORDER PLACED</b> [{strat}] {sig['pattern']}\n"
         f"<b>{symbol}</b> {side} ×{qty}\n"
         f"Entry~₹{entry_px}  SL ₹{sl_px}  🎯 ₹{tgt_px}\n"
         f"IDs: {entry_id} / {sl_id} / {tgt_id}"
@@ -570,25 +520,23 @@ def monitor_oco(dhan) -> None:
     for sym, pos in list(_OPEN_POSITIONS.items()):
         sl_st  = _order_status(dhan, pos["sl_id"])  if pos["sl_id"]  else ""
         tgt_st = _order_status(dhan, pos["tgt_id"]) if pos["tgt_id"] else ""
-
-        if "TRADED" in sl_st or "EXECUTED" in sl_st or "FILLED" in sl_st:
+        if any(k in sl_st for k in ("TRADED", "EXECUTED", "FILLED")):
             _cancel(dhan, pos["tgt_id"])
-            tg_send(f"🛑 SL hit: <b>{sym}</b> @ ₹{pos['sl']}")
+            tg_send(f"🛑 SL hit: <b>{sym}</b> @ ₹{pos['sl']} [{pos.get('strategy','?')}]")
             done.append(sym)
-        elif "TRADED" in tgt_st or "EXECUTED" in tgt_st or "FILLED" in tgt_st:
+        elif any(k in tgt_st for k in ("TRADED", "EXECUTED", "FILLED")):
             _cancel(dhan, pos["sl_id"])
-            tg_send(f"🎉 Target hit: <b>{sym}</b> @ ₹{pos['target']}")
+            tg_send(f"🎉 Target hit: <b>{sym}</b> @ ₹{pos['target']} [{pos.get('strategy','?')}]")
             done.append(sym)
         elif "REJECTED" in sl_st and "REJECTED" in tgt_st:
             tg_send(f"⚠️ Both exits rejected for <b>{sym}</b>, cleaning up")
             done.append(sym)
-
     for sym in done:
         _OPEN_POSITIONS.pop(sym, None)
 
 
 # =====================================================================
-# 6. MAIN LOOP
+# MAIN LOOP
 # =====================================================================
 def wait_until(target_t: dtime) -> None:
     while True:
@@ -611,17 +559,7 @@ def scan_once(dhan, universe: pd.DataFrame) -> pd.DataFrame:
         if df is not None:
             hits = detect_patterns(df)
             if hits:
-                if REQUIRE_CONFIRMATION and len(df) >= 2:
-                    prev_h, prev_l = df["high"].iloc[-2], df["low"].iloc[-2]
-                    close_now = df["close"].iloc[-1]
-                    hits = [
-                        h for h in hits
-                        if (h[0] > 0 and close_now > prev_h) or
-                           (h[0] < 0 and close_now < prev_l) or
-                           h[0] == 0
-                    ]
-                if hits:
-                    signals.extend(score_signals(row.symbol, row.security_id, df, hits))
+                signals.extend(score_signals(row.symbol, row.security_id, df, hits))
         time.sleep(REQUEST_SLEEP_SEC)
         if (i + 1) % 25 == 0:
             log.info(f"  processed {i + 1}/{len(universe)}")
@@ -630,7 +568,7 @@ def scan_once(dhan, universe: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
 
     ranked = (pd.DataFrame(signals)
-              .sort_values(["score", "vol_ratio", "strength"], ascending=[False, False, False])
+              .sort_values(["score", "vol_ratio"], ascending=[False, False])
               .drop_duplicates(subset=["symbol"], keep="first")
               .reset_index(drop=True))
     return ranked
@@ -647,10 +585,10 @@ def act_on_signals(dhan, ranked: pd.DataFrame) -> None:
         if not passes_nifty_gate(direction, ntrend):
             log.debug(f"[{sig['symbol']}] rejected by NIFTY gate")
             continue
+        strat = sig.get("strategy", "?")
         tg_send(
-            f"📊 <b>{sig['symbol']}</b> {sig['signal']} [{sig['pattern']}]\n"
-            f"₹{sig['price']} | Score {sig['score']} | Vol×{sig['vol_ratio']} "
-            f"| {sig['time']}",
+            f"📊 <b>{sig['symbol']}</b> {sig['signal']} [{strat}] {sig['pattern']}\n"
+            f"₹{sig['price']} | Score {sig['score']} | Vol×{sig['vol_ratio']} | {sig['time']}",
             silent=True,
         )
         if sig["score"] >= MIN_SCORE_TO_TRADE and in_session_for_entries():
@@ -658,18 +596,16 @@ def act_on_signals(dhan, ranked: pd.DataFrame) -> None:
 
 
 def run() -> None:
+    # Auto-apply live_config.json if present
     try:
         from live_config import apply_live_config
-        applied = apply_live_config(
-            module_name="intraday_pattern_scanner_v2",
-            tg_sender=tg_send,
-        )
+        applied = apply_live_config(module_name="intraday_pattern_scanner_v2", tg_sender=tg_send)
         if applied:
-            log.info("Live config applied successfully.")
+            log.info("Live config applied.")
     except ImportError:
-        log.debug("live_config module not found — using hardcoded defaults.")
+        log.debug("live_config not found — using hardcoded defaults.")
     except Exception as e:
-        log.warning(f"live_config apply failed ({e}) — using hardcoded defaults.")
+        log.warning(f"live_config apply failed ({e})")
 
     if DHAN_SDK_V2:
         ctx = DhanContext(CLIENT_ID, ACCESS_TOKEN)
@@ -684,8 +620,8 @@ def run() -> None:
         f"🚀 <b>Scanner started</b>\n"
         f"Universe: {len(universe)} | Interval: {CANDLE_INTERVAL_MIN}m\n"
         f"Auto-trade: {'ON ✅' if AUTO_TRADE_ENABLED else 'OFF (dry-run) 🧪'}\n"
-        f"RR: 1:{RISK_REWARD_RATIO} | Max risk/trade: ₹{MAX_RISK_PER_TRADE}\n"
-        f"Strategy: OB Shorts (validated p<0.0001)"
+        f"Strategies: OB Shorts + ORB + Gap-Fill\n"
+        f"RR: 1:{RISK_REWARD_RATIO} | Max risk/trade: ₹{MAX_RISK_PER_TRADE}"
     )
 
     all_signals_today: list[pd.DataFrame] = []
@@ -707,8 +643,7 @@ def run() -> None:
 
             minute_slot = (now.minute // CANDLE_INTERVAL_MIN + 1) * CANDLE_INTERVAL_MIN
             next_scan_at = now.replace(second=5, microsecond=0) + timedelta(
-                minutes=minute_slot - now.minute
-            )
+                minutes=minute_slot - now.minute)
 
         try:
             monitor_oco(dhan)
@@ -723,7 +658,13 @@ def run() -> None:
         fname = f"signals_{now_ist().strftime('%Y%m%d')}.csv"
         combined.to_csv(fname, index=False)
         log.info(f"Saved {len(combined)} signals -> {fname}")
-        tg_send(f"📈 <b>EOD</b>: {len(combined)} signals | traded {len(_TRADED_TODAY)}")
+        # Per-strategy breakdown
+        if "strategy" in combined.columns:
+            breakdown = combined["strategy"].value_counts().to_dict()
+            bstr = " | ".join(f"{k}:{v}" for k, v in breakdown.items())
+            tg_send(f"📈 <b>EOD</b>: {len(combined)} signals ({bstr}) | traded {len(_TRADED_TODAY)}")
+        else:
+            tg_send(f"📈 <b>EOD</b>: {len(combined)} signals | traded {len(_TRADED_TODAY)}")
     else:
         tg_send("ℹ️ EOD: no actionable signals today.")
 
