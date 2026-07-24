@@ -1,24 +1,28 @@
 """
-FLASK WEB SERVICE for Render FREE TIER + external cron (FIXED v2)
+FLASK WEB SERVICE for Render FREE TIER + external cron + TELEGRAM COMMANDS
 
-CHANGES vs v1:
-  * /trigger/scan now runs in a BACKGROUND THREAD, returns 200 instantly
-    (fixes cron-job.org 30-sec timeout on slow Render CPU)
-  * /trigger/oco also backgrounded
-  * Universe is CACHED (not re-downloaded every scan)
-  * Overlap guard: won't start a new scan if one is already running
+CHANGES vs previous:
+  * NEW: /telegram/webhook endpoint — lets you type /status, /health, /help
+    directly in Telegram and get a live reply.
+  * Background-thread scans (no cron timeout)
+  * Universe cached per day
+  * Overlap guard on scans
+
+Telegram commands (type in your bot chat):
+  /status  -> full live status (scans, token, market state, last signal)
+  /health  -> quick alive check
+  /help    -> list commands
 
 Endpoints:
   GET  /                    - status page
   GET  /healthz             - keep-alive ping
   GET  /status              - JSON state dump
+  POST /telegram/webhook    - Telegram command handler  (NEW)
   POST /trigger/refresh     - refresh Dhan token
-  POST /trigger/scan        - fire-and-forget scan (returns instantly)
+  POST /trigger/scan        - fire-and-forget scan
   POST /trigger/oco         - fire-and-forget OCO check
-  POST /trigger/download    - append today's bars + refresh OB data
-  POST /trigger/promote     - manual promote of latest sweep
-
-Auth: /trigger/* require X-Cron-Secret header or ?secret= query param.
+  POST /trigger/download    - append bars + refresh OB data
+  POST /trigger/promote     - promote latest sweep
 """
 from __future__ import annotations
 
@@ -81,7 +85,6 @@ STATE = {
     "errors_last_10":     [],
 }
 
-# Cache the universe so we don't re-download instrument master every scan
 _UNIVERSE = None
 _UNIVERSE_DATE = None
 _SCAN_LOCK = threading.Lock()
@@ -110,11 +113,25 @@ def tg_send(text: str, silent: bool = False):
         pass
 
 
+def tg_send_to(chat_id: str, text: str):
+    """Send to a specific chat (used by webhook replies)."""
+    if not TG_BOT_TOKEN:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
+            json={"chat_id": chat_id, "text": text[:4000], "parse_mode": "HTML"},
+            timeout=5,
+        )
+    except Exception:
+        pass
+
+
 def require_cron_secret(f):
     @wraps(f)
     def _wrap(*a, **kw):
         if not CRON_SECRET:
-            return jsonify({"error": "CRON_SECRET not configured on server"}), 500
+            return jsonify({"error": "CRON_SECRET not configured"}), 500
         supplied = request.headers.get("X-Cron-Secret") or request.args.get("secret")
         if supplied != CRON_SECRET:
             return jsonify({"error": "unauthorized"}), 401
@@ -126,14 +143,12 @@ def boot_restore():
     log.info("=" * 50)
     log.info(f"BOOT at {now_ist().isoformat()}")
     log.info("=" * 50)
-
     try:
         from gist_storage import restore_from_gist
         n = restore_from_gist(BASE_DIR)
         log.info(f"Restored {n} file(s) from Gist")
     except Exception as e:
         log.warning(f"Gist restore skipped: {e}")
-
     try:
         from dhan_token_manager import ensure_valid_token
         tok = ensure_valid_token(force=False)
@@ -143,7 +158,6 @@ def boot_restore():
     except Exception as e:
         log.error(f"Token refresh on boot failed: {e}")
         _record_error(f"boot token: {e}")
-
     tg_send(f"🟢 App booted on Render at {now_ist():%H:%M IST}", silent=True)
 
 
@@ -169,7 +183,6 @@ def reset_dhan():
 
 
 def _get_universe(scn):
-    """Cache the universe per day so we don't re-download every scan."""
     global _UNIVERSE, _UNIVERSE_DATE
     today = now_ist().date()
     if _UNIVERSE is None or _UNIVERSE_DATE != today:
@@ -188,7 +201,7 @@ def _run_module(script: str, args: list, timeout: int) -> int:
             env={**os.environ, "PYTHONUNBUFFERED": "1"},
         )
         if p.returncode != 0:
-            log.error(f"{script} rc={p.returncode}\nSTDERR:\n{p.stderr[-800:]}")
+            log.error(f"{script} rc={p.returncode}\n{p.stderr[-800:]}")
         return p.returncode
     except subprocess.TimeoutExpired:
         log.error(f"{script} TIMEOUT after {timeout}s")
@@ -199,54 +212,41 @@ def _run_module(script: str, args: list, timeout: int) -> int:
 
 
 # =====================================================================
-# BACKGROUND SCAN WORKER
+# BACKGROUND WORKERS
 # =====================================================================
 def _scan_worker():
-    """Runs the full scan in a background thread. Updates STATE."""
     if not _SCAN_LOCK.acquire(blocking=False):
-        log.info("Scan already running, skipping this trigger")
+        log.info("Scan already running, skip")
         return
-
     try:
         STATE["scan_running"] = True
         t = now_ist().time()
         if not (MARKET_OPEN <= t <= MARKET_CLOSE):
             STATE["last_scan_result"] = "skipped (outside market hours)"
             return
-
         import intraday_pattern_scanner_v2 as scn
-
         try:
             from live_config import apply_live_config
             apply_live_config(module_name="intraday_pattern_scanner_v2", tg_sender=tg_send)
         except Exception as e:
-            log.debug(f"live_config apply skipped: {e}")
-
+            log.debug(f"live_config skipped: {e}")
         dhan = get_dhan()
         universe = _get_universe(scn)
-
         ranked = scn.scan_once(dhan, universe)
         STATE["scans_today"] += 1
         STATE["last_scan"] = now_ist().isoformat()
-
         signals_count = len(ranked) if ranked is not None and not ranked.empty else 0
         STATE["signals_today"] += signals_count
-
         if ranked is not None and not ranked.empty and SCAN_START <= t <= NO_ENTRY_AFTER:
             scn.act_on_signals(dhan, ranked)
-            orders = int((ranked["score"] >= scn.MIN_SCORE_TO_TRADE).sum())
-            STATE["orders_today"] += orders
-
+            STATE["orders_today"] += int((ranked["score"] >= scn.MIN_SCORE_TO_TRADE).sum())
         try:
             scn.monitor_oco(dhan)
         except Exception as e:
-            log.debug(f"OCO monitor issue: {e}")
-
+            log.debug(f"OCO issue: {e}")
         STATE["last_scan_result"] = f"ok, {signals_count} signals"
         log.info(f"Scan complete: {signals_count} signals")
-
     except Exception as e:
-        tb = traceback.format_exc()[-500:]
         _record_error(f"scan: {e}")
         STATE["last_scan_result"] = f"error: {str(e)[:100]}"
         tg_send(f"⚠️ Scan error: <code>{str(e)[:200]}</code>")
@@ -256,7 +256,6 @@ def _scan_worker():
 
 
 def _oco_worker():
-    """Background OCO check."""
     try:
         t = now_ist().time()
         if not (MARKET_OPEN <= t <= MARKET_CLOSE):
@@ -268,7 +267,90 @@ def _oco_worker():
 
 
 # =====================================================================
-# ENDPOINTS
+# TELEGRAM COMMAND HANDLER (NEW)
+# =====================================================================
+def _build_status_text() -> str:
+    """Human-readable status for Telegram /status command."""
+    t = now_ist()
+    in_market = MARKET_OPEN <= t.time() <= MARKET_CLOSE
+    in_entry  = SCAN_START <= t.time() <= NO_ENTRY_AFTER
+
+    # Token
+    token_line = "unknown"
+    try:
+        from dhan_token_manager import load_token
+        tok = load_token()
+        if tok:
+            token_line = f"{tok.hours_left:.1f}h left"
+    except Exception:
+        pass
+
+    live_cfg = "active" if (BASE_DIR / "live_config.json").exists() else "hardcoded defaults"
+    ob_data  = "✅" if (BASE_DIR / "ob_data.csv").exists() else "❌ MISSING"
+
+    boot = STATE.get("boot_time_ist", "?")[:19].replace("T", " ")
+    last_scan = STATE.get("last_scan")
+    last_scan = last_scan[11:16] if last_scan else "none yet"
+    errors = STATE.get("errors_last_10", [])
+
+    lines = [
+        f"📊 <b>BOT STATUS</b> — {t:%H:%M:%S IST}",
+        f"",
+        f"🕐 Market open:    {'YES ✅' if in_market else 'NO (closed)'}",
+        f"🎯 Entry window:   {'YES ✅' if in_entry else 'NO'}",
+        f"🔑 Dhan token:     {token_line}",
+        f"⚙️  Live config:    {live_cfg}",
+        f"📁 OB data:        {ob_data}",
+        f"",
+        f"🔄 Scans today:    {STATE.get('scans_today', 0)}",
+        f"📶 Signals today:  {STATE.get('signals_today', 0)}",
+        f"🎯 Orders today:   {STATE.get('orders_today', 0)}",
+        f"⏱  Last scan:      {last_scan}",
+        f"📋 Last result:    {STATE.get('last_scan_result', 'none')}",
+        f"🏃 Scan running:   {'yes' if STATE.get('scan_running') else 'no'}",
+        f"",
+        f"🚀 Booted:         {boot}",
+        f"⚠️  Recent errors:  {len(errors)}",
+    ]
+    if errors:
+        last_err = errors[-1]
+        lines.append(f"   Latest: {last_err.get('msg', '')[:120]}")
+    return "\n".join(lines)
+
+
+@app.route("/telegram/webhook", methods=["POST"])
+def telegram_webhook():
+    """Handles /status, /health, /help typed in Telegram."""
+    try:
+        update = request.get_json(force=True, silent=True) or {}
+        msg = update.get("message") or update.get("edited_message") or {}
+        chat = msg.get("chat", {})
+        chat_id = str(chat.get("id", ""))
+        text = (msg.get("text") or "").strip().lower()
+
+        # Only respond to the configured owner chat (security)
+        if TG_CHAT_ID and chat_id != str(TG_CHAT_ID):
+            return "ok", 200
+
+        if text.startswith("/status"):
+            tg_send_to(chat_id, _build_status_text())
+        elif text.startswith("/health"):
+            tg_send_to(chat_id, "✅ Bot is alive and responding.")
+        elif text.startswith("/help"):
+            tg_send_to(chat_id,
+                       "<b>Commands</b>\n"
+                       "/status — full live status\n"
+                       "/health — quick alive check\n"
+                       "/help — this message")
+        # ignore everything else silently
+        return "ok", 200
+    except Exception as e:
+        log.debug(f"webhook err: {e}")
+        return "ok", 200
+
+
+# =====================================================================
+# HTTP ENDPOINTS
 # =====================================================================
 @app.route("/")
 def index():
@@ -288,9 +370,6 @@ def healthz():
 
 @app.route("/status")
 def status():
-    live_config_exists = (BASE_DIR / "live_config.json").exists()
-    ob_data_exists     = (BASE_DIR / "ob_data.csv").exists()
-
     token_hours_left = None
     try:
         from dhan_token_manager import load_token
@@ -299,13 +378,12 @@ def status():
             token_hours_left = round(tok.hours_left, 2)
     except Exception:
         pass
-
     return jsonify({
         "time_ist":           now_ist().isoformat(),
         "in_market_hours":    MARKET_OPEN <= now_ist().time() <= MARKET_CLOSE,
         "in_entry_window":    SCAN_START <= now_ist().time() <= NO_ENTRY_AFTER,
-        "live_config_active": live_config_exists,
-        "ob_data_active":     ob_data_exists,
+        "live_config_active": (BASE_DIR / "live_config.json").exists(),
+        "ob_data_active":     (BASE_DIR / "ob_data.csv").exists(),
         "token_hours_left":   token_hours_left,
         "state":              STATE,
     })
@@ -320,42 +398,28 @@ def trigger_refresh():
         tok = ensure_valid_token(force=force)
         reset_dhan()
         STATE["last_token_refresh"] = now_ist().isoformat()
-        return jsonify({
-            "ok": True,
-            "token_prefix": tok[:10] + "..." if tok else None,
-            "refreshed_at": STATE["last_token_refresh"],
-        })
+        return jsonify({"ok": True, "token_prefix": tok[:10] + "..." if tok else None})
     except Exception as e:
-        tb = traceback.format_exc()[-500:]
         _record_error(f"refresh: {e}")
         tg_send(f"⚠️ Token refresh FAILED: {e}")
-        return jsonify({"ok": False, "error": str(e), "traceback": tb}), 500
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @app.route("/trigger/scan", methods=["POST", "GET"])
 @require_cron_secret
 def trigger_scan():
-    """
-    Fire-and-forget: launches scan in background thread, returns instantly.
-    This prevents cron-job.org timeouts on slow Render CPU.
-    """
     t = now_ist().time()
     if not (MARKET_OPEN <= t <= MARKET_CLOSE):
-        return jsonify({"ok": True, "skipped": "outside market hours",
-                        "time_ist": t.isoformat()})
-
+        return jsonify({"ok": True, "skipped": "outside market hours"})
     if STATE["scan_running"]:
-        return jsonify({"ok": True, "note": "scan already running, skipped"})
-
+        return jsonify({"ok": True, "note": "scan already running"})
     threading.Thread(target=_scan_worker, daemon=True).start()
-    return jsonify({"ok": True, "note": "scan started in background",
-                    "time_ist": now_ist().isoformat()})
+    return jsonify({"ok": True, "note": "scan started in background"})
 
 
 @app.route("/trigger/oco", methods=["POST", "GET"])
 @require_cron_secret
 def trigger_oco():
-    """Fire-and-forget OCO check."""
     t = now_ist().time()
     if not (MARKET_OPEN <= t <= MARKET_CLOSE):
         return jsonify({"ok": True, "skipped": "outside market hours"})
@@ -366,20 +430,14 @@ def trigger_oco():
 @app.route("/trigger/download", methods=["POST", "GET"])
 @require_cron_secret
 def trigger_download():
-    """
-    Download today's bars + refresh OB zones. Runs in background thread
-    because it takes 2-3 min (would timeout the cron otherwise).
-    """
-    def _dl_worker():
+    def _dl():
         try:
             rc1 = _run_module("csv_downloader.py",
                               ["--mode", "dhan", "--preset", "nifty50",
-                               "--out", str(DATA_DIR)],
-                              timeout=600)
+                               "--out", str(DATA_DIR)], timeout=600)
             rc2 = _run_module("precompute_order_blocks.py",
                               ["--csv-dir", str(DATA_DIR),
-                               "--out", str(BASE_DIR / "ob_data.csv")],
-                              timeout=300)
+                               "--out", str(BASE_DIR / "ob_data.csv")], timeout=300)
             STATE["last_download"] = now_ist().isoformat()
             if rc1 != 0 or rc2 != 0:
                 tg_send(f"⚠️ Data pipeline: dl_rc={rc1}, ob_rc={rc2}")
@@ -388,8 +446,7 @@ def trigger_download():
         except Exception as e:
             _record_error(f"download: {e}")
             tg_send(f"⚠️ Download crashed: {e}")
-
-    threading.Thread(target=_dl_worker, daemon=True).start()
+    threading.Thread(target=_dl, daemon=True).start()
     return jsonify({"ok": True, "note": "download started in background"})
 
 
@@ -401,8 +458,7 @@ def trigger_promote():
         if not sweeps:
             return jsonify({"ok": False, "error": "no sweep files"}), 404
         rc = _run_module("live_config.py",
-                         ["promote", "--sweep", str(sweeps[-1]), "--force"],
-                         timeout=60)
+                         ["promote", "--sweep", str(sweeps[-1]), "--force"], timeout=60)
         if rc == 0:
             try:
                 from gist_storage import backup_to_gist
@@ -414,9 +470,6 @@ def trigger_promote():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
-# =====================================================================
-# BOOT
-# =====================================================================
 boot_restore()
 
 
