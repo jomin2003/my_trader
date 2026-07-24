@@ -1,25 +1,23 @@
 """
-MULTI-STRATEGY LIVE MODULE — OB Shorts + ORB + Gap-Fill (all 3).
+MULTI-STRATEGY LIVE MODULE — OB Shorts + ORB + Gap-Fill + Candle-Structure.
 
 Drop-in replacement for scanner's detect_patterns / score_signals.
-Each signal is tagged with 'strategy' so Telegram/logs show which fired.
+Each signal tagged with 'strategy'. Candle-Structure signals also carry
+'struct_sl' + 'struct_target' so the scanner uses structural exits
+(targets placed just INSIDE real S/R walls -> they actually fill).
 
-Requires precomputed data files:
-  - ob_data.csv   (from precompute_order_blocks.py)  -> OB Shorts
-  - gap_data.csv  (from precompute_gapfill.py)        -> Gap-Fill
-  (ORB needs no precompute — opening range is built live.)
+Requires:
+  ob_data.csv    (precompute_order_blocks.py)  -> OB Shorts
+  gap_data.csv   (precompute_gapfill.py)       -> Gap-Fill
+  structure_levels.py                          -> Candle-Structure exits
+  (ORB needs no precompute.)
 
-STRATEGY A — OB SHORTS (validated p<0.0001):
-  shooting-star rejection at a bear order-block zone, vol>1.2×SMA,
-  SHORT only, entry 10:00-14:00.
-
-STRATEGY B — ORB (opening range breakout):
-  fresh close beyond 09:15-09:30 range, vol>1.2×SMA, LONG+SHORT,
-  entry 09:30-11:00, one trade/direction/day.
-
-STRATEGY C — GAP-FILL (fade the gap):
-  gap 1-3%, fresh close back through opposite OR edge on LOW volume
-  (below vol-EMA20 = exhaustion), target = prev close, entry 09:30-11:30.
+STRATEGIES:
+  A) OB SHORTS      - shooting star at bear OB zone, SHORT, 10:00-14:00
+  B) ORB            - opening-range breakout, LONG+SHORT, 09:30-11:00
+  C) GAP-FILL       - fade 1-3% gap on low volume, 09:30-11:30
+  D) CANDLE-STRUCT  - candlestick reversal + structure-based SL/target
+                      (engulfing/hammer/star), VWAP-aligned, 09:30-14:30
 """
 from __future__ import annotations
 
@@ -29,10 +27,18 @@ from datetime import time as dtime
 import pandas as pd
 import intraday_pattern_scanner_v2 as scn
 
+# structural exits (targets inside S/R walls)
+try:
+    from structure_levels import compute_structure_sl_target
+    _STRUCT_OK = True
+except Exception as _e:
+    _STRUCT_OK = False
+    print(f"[MULTI] structure_levels not available ({_e}) — Candle-Struct disabled")
+
 # ---------- shared scanner config ----------
 scn.MIN_CANDLES_NEEDED   = 4
 scn.REQUIRE_CONFIRMATION = False
-scn.RISK_REWARD_RATIO    = 2.0   # blended default (see note in deploy guide)
+scn.RISK_REWARD_RATIO    = 2.0
 
 # ---------- OB SHORTS params ----------
 OB_DATA_PATH       = os.getenv("OB_DATA_PATH", str(Path(__file__).parent / "ob_data.csv"))
@@ -58,6 +64,12 @@ GAP_ENTRY_START    = (9, 30)
 GAP_ENTRY_END      = (11, 30)
 GAP_SL_ATR_MULT    = 0.1
 GAP_VOL_EMA_LEN    = 20
+
+# ---------- CANDLE-STRUCTURE params ----------
+CS_ENTRY_START     = (9, 30)
+CS_ENTRY_END       = (14, 30)
+CS_VOL_MULT        = 1.2
+CS_MIN_BARS        = 20      # need history for swings/ATR
 
 # ---------- lookup tables ----------
 _OB = {}; _OB_LOADED = False
@@ -136,6 +148,36 @@ def _shooting_star(o, h, l, c):
     return True
 
 
+def _body(o, c): return abs(c - o)
+def _rng(h, l):  return max(h - l, 1e-9)
+
+
+def _candle_patterns(df):
+    """Return list of (direction, name, strength) candlestick reversals."""
+    if len(df) < 3:
+        return []
+    o0,h0,l0,c0 = (float(df[x].iloc[-3]) for x in ["open","high","low","close"])
+    o1,h1,l1,c1 = (float(df[x].iloc[-2]) for x in ["open","high","low","close"])
+    o2,h2,l2,c2 = (float(df[x].iloc[-1]) for x in ["open","high","low","close"])
+    hits = []
+    b1, b2 = _body(o1,c1), _body(o2,c2); r2 = _rng(h2,l2)
+    uw = h2-max(o2,c2); lw = min(o2,c2)-l2
+    if c1<o1 and c2>o2 and o2<=c1 and c2>=o1 and b2>b1:
+        hits.append((+1, "Bullish Engulfing", 5))
+    if c1>o1 and c2<o2 and o2>=c1 and c2<=o1 and b2>b1:
+        hits.append((-1, "Bearish Engulfing", 5))
+    if b2>0 and lw>=2*b2 and uw<=0.3*b2 and b2/r2<=0.35:
+        hits.append((+1, "Hammer", 4))
+    if b2>0 and uw>=2*b2 and lw<=0.3*b2 and b2/r2<=0.35:
+        hits.append((-1, "Shooting Star", 4))
+    mid0=(o0+c0)/2
+    if c0<o0 and _body(o0,c0)>0.6*_rng(h0,l0) and b1<0.4*_body(o0,c0) and c2>o2 and b2>0.6*r2 and c2>mid0:
+        hits.append((+1, "Morning Star", 5))
+    if c0>o0 and _body(o0,c0)>0.6*_rng(h0,l0) and b1<0.4*_body(o0,c0) and c2<o2 and b2>0.6*r2 and c2<mid0:
+        hits.append((-1, "Evening Star", 5))
+    return hits
+
+
 def _day(df):
     return df[df["ts"].dt.date == df["ts"].iloc[-1].date()]
 
@@ -146,8 +188,13 @@ def _or(day):
     return float(orb["high"].max()), float(orb["low"].min())
 
 
+# tag candle patterns so score_signals can route them
+_CANDLE_NAMES = {"Bullish Engulfing","Bearish Engulfing","Hammer",
+                 "Shooting Star","Morning Star","Evening Star"}
+
+
 # =====================================================================
-# detect_patterns — runs all 3
+# detect_patterns — runs all 4 strategies
 # =====================================================================
 def detect_patterns(df):
     if len(df) < scn.MIN_CANDLES_NEEDED or "ts" not in df.columns:
@@ -168,18 +215,20 @@ def detect_patterns(df):
     day = _day(df); rng = _or(day)
     if rng is not None:
         or_high, or_low = rng
-        # B) ORB breakout (both dir)
         if _win(ts, ORB_ENTRY_START, ORB_ENTRY_END):
             if c > or_high and prev_c <= or_high:
                 hits.append((+1, "ORB Long", 5))
             elif c < or_low and prev_c >= or_low:
                 hits.append((-1, "ORB Short", 5))
-        # C) GAP-FILL (fade): short if breaks below OR_low, long if above OR_high
         if _win(ts, GAP_ENTRY_START, GAP_ENTRY_END):
             if c < or_low and prev_c >= or_low:
                 hits.append((-1, "GapFill Short", 5))
             elif c > or_high and prev_c <= or_high:
                 hits.append((+1, "GapFill Long", 5))
+
+    # D) CANDLE-STRUCTURE (entries across the session)
+    if _STRUCT_OK and len(df) >= CS_MIN_BARS and _win(ts, CS_ENTRY_START, CS_ENTRY_END):
+        hits.extend(_candle_patterns(df))
 
     return hits
 
@@ -201,7 +250,7 @@ def score_signals(symbol, security_id, df, hits):
     vol_ratio = vol_now / avg_vol
     atr_val = scn.wilder_atr(df, 14)
     if atr_val is None or atr_val <= 0:
-        atr_val = close_now * 0.005   # fallback early in day
+        atr_val = close_now * 0.005
     vwap_val = scn.rolling_vwap(df)
     today = df["ts"].iloc[-1].date()
     now_t = df["ts"].iloc[-1].strftime("%H:%M")
@@ -245,10 +294,8 @@ def score_signals(symbol, security_id, df, hits):
             if gap is None: continue
             if gap["gap_pct"] < GAP_MIN_PCT or gap["gap_pct"] > GAP_MAX_PCT: continue
             direction = 1 if name == "GapFill Long" else -1
-            # short only on gap-up, long only on gap-down
             if direction < 0 and gap["dir"] != "UP": continue
             if direction > 0 and gap["dir"] != "DOWN": continue
-            # LOW-volume exhaustion filter (vol below EMA20)
             vol_ema = df["volume"].ewm(span=GAP_VOL_EMA_LEN, adjust=False).mean().iloc[-1]
             if vol_now >= vol_ema: continue
             k = (symbol, today, "GAP", direction)
@@ -259,6 +306,35 @@ def score_signals(symbol, security_id, df, hits):
                              strength+2, round(vol_now/max(vol_ema,1),2),
                              close_now, high_now, low_now,
                              gap["daily_atr"], vwap_val, now_t, "GAPFILL"))
+
+        # ===== CANDLE-STRUCTURE =====
+        elif name in _CANDLE_NAMES and _STRUCT_OK:
+            if vol_ratio < CS_VOL_MULT: continue
+            # VWAP alignment
+            if vwap_val is not None:
+                if signal > 0 and close_now <= vwap_val: continue
+                if signal < 0 and close_now >= vwap_val: continue
+            k = (symbol, today, "CANDLE", signal)
+            if k in _TRADED: continue
+            # opening range for structure inputs
+            day = _day(df); rng = _or(day)
+            or_high = rng[0] if rng else None
+            or_low  = rng[1] if rng else None
+            s_sl, s_tgt, meta = compute_structure_sl_target(
+                df, close_now, signal, atr_val,
+                or_high=or_high, or_low=or_low, vwap=vwap_val)
+            _TRADED.add(k)
+            r = _row(symbol, security_id, f"{name} (STRUCT)",
+                     "BUY" if signal>0 else "SELL", signal,
+                     strength+1, vol_ratio, close_now, high_now, low_now,
+                     atr_val, vwap_val, now_t, "CANDLE_STRUCT")
+            # attach structural exits — scanner will prefer these
+            r["struct_sl"] = s_sl
+            r["struct_target"] = s_tgt
+            r["rr"] = meta["rr"]
+            r["sl_method"] = meta["sl_method"]
+            r["tgt_method"] = meta["tgt_method"]
+            rows.append(r)
 
     return rows
 
