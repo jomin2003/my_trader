@@ -1,23 +1,24 @@
 """
-FLASK WEB SERVICE for Render FREE TIER + external cron (FIXED)
+FLASK WEB SERVICE for Render FREE TIER + external cron (FIXED v2)
+
+CHANGES vs v1:
+  * /trigger/scan now runs in a BACKGROUND THREAD, returns 200 instantly
+    (fixes cron-job.org 30-sec timeout on slow Render CPU)
+  * /trigger/oco also backgrounded
+  * Universe is CACHED (not re-downloaded every scan)
+  * Overlap guard: won't start a new scan if one is already running
 
 Endpoints:
   GET  /                    - status page
   GET  /healthz             - keep-alive ping
   GET  /status              - JSON state dump
   POST /trigger/refresh     - refresh Dhan token
-  POST /trigger/scan        - one scan+act pass (every 5 min in mkt hrs)
-  POST /trigger/oco         - poll open positions
+  POST /trigger/scan        - fire-and-forget scan (returns instantly)
+  POST /trigger/oco         - fire-and-forget OCO check
   POST /trigger/download    - append today's bars + refresh OB data
   POST /trigger/promote     - manual promote of latest sweep
 
-Auth: /trigger/* endpoints require X-Cron-Secret header or ?secret= query param
-matching CRON_SECRET env var.
-
-Environment variables (Render dashboard):
-  DHAN_CLIENT_ID, DHAN_PIN, DHAN_TOTP_SECRET, DHAN_ACCESS_TOKEN
-  TG_BOT_TOKEN, TG_CHAT_ID
-  CRON_SECRET, GITHUB_TOKEN, GITHUB_GIST_ID
+Auth: /trigger/* require X-Cron-Secret header or ?secret= query param.
 """
 from __future__ import annotations
 
@@ -28,6 +29,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 import traceback
 from datetime import datetime, time as dtime
 from functools import wraps
@@ -69,13 +71,20 @@ app = Flask(__name__)
 STATE = {
     "boot_time_ist":      datetime.now(IST).isoformat(),
     "last_scan":          None,
+    "last_scan_result":   None,
     "last_download":      None,
     "last_token_refresh": None,
     "scans_today":        0,
     "signals_today":      0,
     "orders_today":       0,
+    "scan_running":       False,
     "errors_last_10":     [],
 }
+
+# Cache the universe so we don't re-download instrument master every scan
+_UNIVERSE = None
+_UNIVERSE_DATE = None
+_SCAN_LOCK = threading.Lock()
 
 
 def now_ist() -> datetime:
@@ -114,7 +123,6 @@ def require_cron_secret(f):
 
 
 def boot_restore():
-    """Called once at process start. Never raises."""
     log.info("=" * 50)
     log.info(f"BOOT at {now_ist().isoformat()}")
     log.info("=" * 50)
@@ -160,8 +168,18 @@ def reset_dhan():
         _DHAN = None
 
 
+def _get_universe(scn):
+    """Cache the universe per day so we don't re-download every scan."""
+    global _UNIVERSE, _UNIVERSE_DATE
+    today = now_ist().date()
+    if _UNIVERSE is None or _UNIVERSE_DATE != today:
+        _UNIVERSE = scn.load_intraday_universe()
+        _UNIVERSE_DATE = today
+        log.info(f"Universe cached: {len(_UNIVERSE)} stocks for {today}")
+    return _UNIVERSE
+
+
 def _run_module(script: str, args: list, timeout: int) -> int:
-    """Run a python script as subprocess. Returns exit code."""
     log.info(f"Running: python {script} {' '.join(args)}")
     try:
         p = subprocess.run(
@@ -181,17 +199,85 @@ def _run_module(script: str, args: list, timeout: int) -> int:
 
 
 # =====================================================================
+# BACKGROUND SCAN WORKER
+# =====================================================================
+def _scan_worker():
+    """Runs the full scan in a background thread. Updates STATE."""
+    if not _SCAN_LOCK.acquire(blocking=False):
+        log.info("Scan already running, skipping this trigger")
+        return
+
+    try:
+        STATE["scan_running"] = True
+        t = now_ist().time()
+        if not (MARKET_OPEN <= t <= MARKET_CLOSE):
+            STATE["last_scan_result"] = "skipped (outside market hours)"
+            return
+
+        import intraday_pattern_scanner_v2 as scn
+
+        try:
+            from live_config import apply_live_config
+            apply_live_config(module_name="intraday_pattern_scanner_v2", tg_sender=tg_send)
+        except Exception as e:
+            log.debug(f"live_config apply skipped: {e}")
+
+        dhan = get_dhan()
+        universe = _get_universe(scn)
+
+        ranked = scn.scan_once(dhan, universe)
+        STATE["scans_today"] += 1
+        STATE["last_scan"] = now_ist().isoformat()
+
+        signals_count = len(ranked) if ranked is not None and not ranked.empty else 0
+        STATE["signals_today"] += signals_count
+
+        if ranked is not None and not ranked.empty and SCAN_START <= t <= NO_ENTRY_AFTER:
+            scn.act_on_signals(dhan, ranked)
+            orders = int((ranked["score"] >= scn.MIN_SCORE_TO_TRADE).sum())
+            STATE["orders_today"] += orders
+
+        try:
+            scn.monitor_oco(dhan)
+        except Exception as e:
+            log.debug(f"OCO monitor issue: {e}")
+
+        STATE["last_scan_result"] = f"ok, {signals_count} signals"
+        log.info(f"Scan complete: {signals_count} signals")
+
+    except Exception as e:
+        tb = traceback.format_exc()[-500:]
+        _record_error(f"scan: {e}")
+        STATE["last_scan_result"] = f"error: {str(e)[:100]}"
+        tg_send(f"⚠️ Scan error: <code>{str(e)[:200]}</code>")
+    finally:
+        STATE["scan_running"] = False
+        _SCAN_LOCK.release()
+
+
+def _oco_worker():
+    """Background OCO check."""
+    try:
+        t = now_ist().time()
+        if not (MARKET_OPEN <= t <= MARKET_CLOSE):
+            return
+        import intraday_pattern_scanner_v2 as scn
+        scn.monitor_oco(get_dhan())
+    except Exception as e:
+        _record_error(f"oco: {e}")
+
+
+# =====================================================================
 # ENDPOINTS
 # =====================================================================
 @app.route("/")
 def index():
     return jsonify({
-        "service":       "intraday_pattern_scanner",
-        "status":        "running",
-        "time_ist":      now_ist().isoformat(),
-        "boot_time":     STATE["boot_time_ist"],
-        "in_market":     MARKET_OPEN <= now_ist().time() <= MARKET_CLOSE,
-        "state":         STATE,
+        "service":   "intraday_pattern_scanner",
+        "status":    "running",
+        "time_ist":  now_ist().isoformat(),
+        "in_market": MARKET_OPEN <= now_ist().time() <= MARKET_CLOSE,
+        "state":     STATE,
     })
 
 
@@ -228,7 +314,6 @@ def status():
 @app.route("/trigger/refresh", methods=["POST", "GET"])
 @require_cron_secret
 def trigger_refresh():
-    """Refresh Dhan token via TOTP."""
     try:
         from dhan_token_manager import ensure_valid_token
         force = request.args.get("force") == "1"
@@ -250,109 +335,67 @@ def trigger_refresh():
 @app.route("/trigger/scan", methods=["POST", "GET"])
 @require_cron_secret
 def trigger_scan():
-    """One scan+act pass. Cron every 5 min in market hours."""
-    try:
-        t = now_ist().time()
-        if not (MARKET_OPEN <= t <= MARKET_CLOSE):
-            return jsonify({"skipped": "outside market hours", "time_ist": t.isoformat()})
+    """
+    Fire-and-forget: launches scan in background thread, returns instantly.
+    This prevents cron-job.org timeouts on slow Render CPU.
+    """
+    t = now_ist().time()
+    if not (MARKET_OPEN <= t <= MARKET_CLOSE):
+        return jsonify({"ok": True, "skipped": "outside market hours",
+                        "time_ist": t.isoformat()})
 
-        import intraday_pattern_scanner_v2 as scn
+    if STATE["scan_running"]:
+        return jsonify({"ok": True, "note": "scan already running, skipped"})
 
-        try:
-            from live_config import apply_live_config
-            apply_live_config(module_name="intraday_pattern_scanner_v2", tg_sender=tg_send)
-        except Exception as e:
-            log.debug(f"live_config apply skipped: {e}")
-
-        dhan = get_dhan()
-        universe = scn.load_intraday_universe()
-
-        ranked = scn.scan_once(dhan, universe)
-        STATE["scans_today"] += 1
-        STATE["last_scan"] = now_ist().isoformat()
-
-        signals_count = len(ranked) if ranked is not None and not ranked.empty else 0
-        STATE["signals_today"] += signals_count
-
-        if ranked is not None and not ranked.empty and SCAN_START <= t <= NO_ENTRY_AFTER:
-            scn.act_on_signals(dhan, ranked)
-            orders = int((ranked["score"] >= scn.MIN_SCORE_TO_TRADE).sum())
-            STATE["orders_today"] += orders
-
-        try:
-            scn.monitor_oco(dhan)
-        except Exception as e:
-            log.debug(f"OCO monitor issue: {e}")
-
-        return jsonify({
-            "ok": True,
-            "signals": signals_count,
-            "scans_today": STATE["scans_today"],
-            "time_ist": now_ist().isoformat(),
-        })
-    except Exception as e:
-        tb = traceback.format_exc()[-500:]
-        _record_error(f"scan: {e}")
-        tg_send(f"⚠️ Scan error: <code>{str(e)[:200]}</code>")
-        return jsonify({"ok": False, "error": str(e), "traceback": tb}), 500
+    threading.Thread(target=_scan_worker, daemon=True).start()
+    return jsonify({"ok": True, "note": "scan started in background",
+                    "time_ist": now_ist().isoformat()})
 
 
 @app.route("/trigger/oco", methods=["POST", "GET"])
 @require_cron_secret
 def trigger_oco():
-    """OCO cleanup only (lighter than full scan)."""
-    try:
-        t = now_ist().time()
-        if not (MARKET_OPEN <= t <= MARKET_CLOSE):
-            return jsonify({"skipped": "outside market hours"})
-
-        import intraday_pattern_scanner_v2 as scn
-        scn.monitor_oco(get_dhan())
-        return jsonify({"ok": True, "time_ist": now_ist().isoformat()})
-    except Exception as e:
-        _record_error(f"oco: {e}")
-        return jsonify({"ok": False, "error": str(e)}), 500
+    """Fire-and-forget OCO check."""
+    t = now_ist().time()
+    if not (MARKET_OPEN <= t <= MARKET_CLOSE):
+        return jsonify({"ok": True, "skipped": "outside market hours"})
+    threading.Thread(target=_oco_worker, daemon=True).start()
+    return jsonify({"ok": True, "note": "oco check started"})
 
 
 @app.route("/trigger/download", methods=["POST", "GET"])
 @require_cron_secret
 def trigger_download():
-    """Append today's bars + refresh OB zones. Runs after market close."""
-    try:
-        rc1 = _run_module("csv_downloader.py",
-                          ["--mode", "dhan", "--preset", "nifty50",
-                           "--out", str(DATA_DIR)],
-                          timeout=600)
+    """
+    Download today's bars + refresh OB zones. Runs in background thread
+    because it takes 2-3 min (would timeout the cron otherwise).
+    """
+    def _dl_worker():
+        try:
+            rc1 = _run_module("csv_downloader.py",
+                              ["--mode", "dhan", "--preset", "nifty50",
+                               "--out", str(DATA_DIR)],
+                              timeout=600)
+            rc2 = _run_module("precompute_order_blocks.py",
+                              ["--csv-dir", str(DATA_DIR),
+                               "--out", str(BASE_DIR / "ob_data.csv")],
+                              timeout=300)
+            STATE["last_download"] = now_ist().isoformat()
+            if rc1 != 0 or rc2 != 0:
+                tg_send(f"⚠️ Data pipeline: dl_rc={rc1}, ob_rc={rc2}")
+            else:
+                tg_send("✅ Post-market data + OB zones refreshed", silent=True)
+        except Exception as e:
+            _record_error(f"download: {e}")
+            tg_send(f"⚠️ Download crashed: {e}")
 
-        rc2 = _run_module("precompute_order_blocks.py",
-                          ["--csv-dir", str(DATA_DIR),
-                           "--out", str(BASE_DIR / "ob_data.csv")],
-                          timeout=300)
-
-        STATE["last_download"] = now_ist().isoformat()
-
-        overall_ok = (rc1 == 0 and rc2 == 0)
-        result = {
-            "ok": overall_ok,
-            "download_rc": rc1,
-            "ob_precompute_rc": rc2,
-            "time_ist": now_ist().isoformat(),
-        }
-
-        if not overall_ok:
-            tg_send(f"⚠️ Post-market data pipeline failed: dl_rc={rc1}, ob_rc={rc2}")
-
-        return jsonify(result)
-    except Exception as e:
-        _record_error(f"download: {e}")
-        tg_send(f"⚠️ Download endpoint crashed: {e}")
-        return jsonify({"ok": False, "error": str(e)}), 500
+    threading.Thread(target=_dl_worker, daemon=True).start()
+    return jsonify({"ok": True, "note": "download started in background"})
 
 
 @app.route("/trigger/promote", methods=["POST", "GET"])
 @require_cron_secret
 def trigger_promote():
-    """Manually promote latest sweep to live config + back up to Gist."""
     try:
         sweeps = sorted(SW_DIR.glob("sweep_*.csv"), key=lambda p: p.stat().st_mtime)
         if not sweeps:
