@@ -1,9 +1,12 @@
 """Precompute Order Blocks from 5-min data (aggregates to 15-min for OB detection)."""
 from __future__ import annotations
 import argparse
+import logging
 from pathlib import Path
 import pandas as pd
 import numpy as np
+
+log = logging.getLogger("precompute_ob")
 
 ATR_PERIOD = 20
 BREAK_ATR_MULT = 1.0
@@ -87,16 +90,16 @@ def main():
             df = df.dropna(subset=["open","high","low","close"])
             df = df[df["volume"] > 0].reset_index(drop=True)
         except Exception as e:
-            print(f"  Skip {fp.name}: {e}"); continue
+            log.warning(f"Skip {fp.name}: {e}"); continue
         if df.empty: continue
         obs = find_order_blocks(aggregate_15m(df), sym)
         all_obs.extend(obs)
-        print(f"  {sym}: {len(obs)} OBs")
+        log.info(f"  {sym}: {len(obs)} OBs")
     out_df = pd.DataFrame(all_obs)
     if out_df.empty: raise SystemExit("No OBs found.")
     out_df.to_csv(Path(args.out).expanduser().resolve(), index=False)
-    print(f"\nSaved {len(out_df)} OBs")
-    print(f"  Bull: {(out_df['ob_type']=='BULL').sum()}, Bear: {(out_df['ob_type']=='BEAR').sum()}")
+    log.info(f"Saved {len(out_df)} OBs")
+    log.info(f"  Bull: {(out_df['ob_type']=='BULL').sum()}, Bear: {(out_df['ob_type']=='BEAR').sum()}")
 
 
 if __name__ == "__main__":

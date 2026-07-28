@@ -88,6 +88,8 @@ STATE = {
 _UNIVERSE = None
 _UNIVERSE_DATE = None
 _SCAN_LOCK = threading.Lock()
+_TG_RATE: dict[str, list[float]] = {}  # chat_id -> list of timestamps
+_TG_RATE_LIMIT = 10  # max requests per 60 seconds
 
 
 def now_ist() -> datetime:
@@ -139,6 +141,9 @@ def require_cron_secret(f):
     return _wrap
 
 
+_TRADING_HALTED = False
+
+
 def boot_restore():
     log.info("=" * 50)
     log.info(f"BOOT at {now_ist().isoformat()}")
@@ -153,6 +158,7 @@ def boot_restore():
         from dhan_token_manager import ensure_valid_token
         tok = ensure_valid_token(force=False)
         if tok:
+            reset_dhan()
             STATE["last_token_refresh"] = now_ist().isoformat()
             log.info("Dhan token ready")
     except Exception as e:
@@ -189,6 +195,14 @@ def _get_universe(scn):
         _UNIVERSE = scn.load_intraday_universe()
         _UNIVERSE_DATE = today
         log.info(f"Universe cached: {len(_UNIVERSE)} stocks for {today}")
+        # Day-boundary: clear strategy caches and traded-today sets
+        try:
+            import multi_strategy_live
+            multi_strategy_live.clear_cache()
+            log.info("Day-boundary: strategy caches cleared")
+        except Exception:
+            pass
+        scn._TRADED_TODAY.clear()
     return _UNIVERSE
 
 
@@ -238,8 +252,11 @@ def _scan_worker():
         signals_count = len(ranked) if ranked is not None and not ranked.empty else 0
         STATE["signals_today"] += signals_count
         if ranked is not None and not ranked.empty and SCAN_START <= t <= NO_ENTRY_AFTER:
-            scn.act_on_signals(dhan, ranked)
-            STATE["orders_today"] += int((ranked["score"] >= scn.MIN_SCORE_TO_TRADE).sum())
+            if not _TRADING_HALTED:
+                scn.act_on_signals(dhan, ranked)
+                STATE["orders_today"] += int((ranked["score"] >= scn.MIN_SCORE_TO_TRADE).sum())
+            else:
+                log.info("Trading halted — skipping order placement")
         try:
             scn.monitor_oco(dhan)
         except Exception as e:
@@ -298,6 +315,7 @@ def _build_status_text() -> str:
         f"",
         f"🕐 Market open:    {'YES ✅' if in_market else 'NO (closed)'}",
         f"🎯 Entry window:   {'YES ✅' if in_entry else 'NO'}",
+        f"🛑 Trading halted: {'YES ⛔' if _TRADING_HALTED else 'NO ✅'}",
         f"🔑 Dhan token:     {token_line}",
         f"⚙️  Live config:    {live_cfg}",
         f"📁 OB data:        {ob_data}",
@@ -320,7 +338,8 @@ def _build_status_text() -> str:
 
 @app.route("/telegram/webhook", methods=["POST"])
 def telegram_webhook():
-    """Handles /status, /health, /help typed in Telegram."""
+    """Handles /status, /health, /help, /stop, /resume typed in Telegram."""
+    global _TRADING_HALTED
     try:
         update = request.get_json(force=True, silent=True) or {}
         msg = update.get("message") or update.get("edited_message") or {}
@@ -332,15 +351,34 @@ def telegram_webhook():
         if TG_CHAT_ID and chat_id != str(TG_CHAT_ID):
             return "ok", 200
 
+        # Rate limiting
+        now = time.time()
+        history = _TG_RATE.get(chat_id, [])
+        history = [t for t in history if now - t < 60]
+        if len(history) >= _TG_RATE_LIMIT:
+            return "ok", 200
+        history.append(now)
+        _TG_RATE[chat_id] = history
+
         if text.startswith("/status"):
             tg_send_to(chat_id, _build_status_text())
         elif text.startswith("/health"):
             tg_send_to(chat_id, "✅ Bot is alive and responding.")
+        elif text.startswith("/stop"):
+            _TRADING_HALTED = True
+            tg_send_to(chat_id, "🛑 Trading HALTED. No new orders will be placed. Use /resume to restart.")
+            log.warning("Trading halted via Telegram /stop command")
+        elif text.startswith("/resume"):
+            _TRADING_HALTED = False
+            tg_send_to(chat_id, "▶️ Trading RESUMED. Orders will be placed again.")
+            log.info("Trading resumed via Telegram /resume command")
         elif text.startswith("/help"):
             tg_send_to(chat_id,
                        "<b>Commands</b>\n"
                        "/status — full live status\n"
                        "/health — quick alive check\n"
+                       "/stop — halt all new orders\n"
+                       "/resume — resume trading\n"
                        "/help — this message")
         # ignore everything else silently
         return "ok", 200

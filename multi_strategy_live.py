@@ -21,11 +21,18 @@ STRATEGIES:
 """
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 from datetime import time as dtime
 import pandas as pd
 import intraday_pattern_scanner_v2 as scn
+
+log = logging.getLogger("multi_strategy")
+
+# ADX momentum filter: skip choppy/range-bound stocks
+ADX_FILTER_ENABLED = True
+ADX_MIN_THRESHOLD  = 20  # skip stocks with ADX below this (range-bound)
 
 # structural exits (targets inside S/R walls)
 try:
@@ -33,7 +40,7 @@ try:
     _STRUCT_OK = True
 except Exception as _e:
     _STRUCT_OK = False
-    print(f"[MULTI] structure_levels not available ({_e}) — Candle-Struct disabled")
+    log.warning(f"structure_levels not available ({_e}) — Candle-Struct disabled")
 
 # ---------- shared scanner config ----------
 scn.MIN_CANDLES_NEEDED   = 4
@@ -88,11 +95,11 @@ def _load_ob():
                 _OB.setdefault((r.symbol.upper(), r.date), []).append(
                     {"type": r.ob_type, "time": r.ob_time,
                      "hi": float(r.ob_body_high), "lo": float(r.ob_body_low)})
-            print(f"[MULTI] OB zones: {sum(len(v) for v in _OB.values())}")
+            log.info(f"OB zones: {sum(len(v) for v in _OB.values())}")
         except Exception as e:
-            print(f"[MULTI] OB load failed: {e}")
+            log.warning(f"OB load failed: {e}")
     else:
-        print(f"[MULTI] ob_data.csv missing — OB Shorts disabled")
+        log.warning("ob_data.csv missing — OB Shorts disabled")
     _OB_LOADED = True
 
 
@@ -107,11 +114,11 @@ def _load_gap():
                 _GAP[(r.symbol.upper(), r.date)] = {
                     "prev_close": float(r.prev_close), "gap_pct": float(r.gap_pct),
                     "dir": r.gap_dir, "daily_atr": float(r.daily_atr)}
-            print(f"[MULTI] Gap-days: {len(_GAP)}")
+            log.info(f"Gap-days: {len(_GAP)}")
         except Exception as e:
-            print(f"[MULTI] Gap load failed: {e}")
+            log.warning(f"Gap load failed: {e}")
     else:
-        print(f"[MULTI] gap_data.csv missing — Gap-Fill disabled")
+        log.warning("gap_data.csv missing — Gap-Fill disabled")
     _GAP_LOADED = True
 
 
@@ -238,6 +245,12 @@ def detect_patterns(df):
 # =====================================================================
 def score_signals(symbol, security_id, df, hits):
     if not hits: return []
+
+    # ADX momentum filter — reject choppy stocks
+    if ADX_FILTER_ENABLED and len(df) >= 28:
+        adx_val = scn.adx(df, 14)
+        if adx_val is not None and adx_val < ADX_MIN_THRESHOLD:
+            return []
 
     close_now = float(df["close"].iloc[-1])
     high_now  = float(df["high"].iloc[-1])

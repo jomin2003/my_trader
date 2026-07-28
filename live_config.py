@@ -159,20 +159,20 @@ def promote(sweep_csv: Path, out_path: Path, row_index: int,
     out_path.write_text(json.dumps(cfg, indent=2, default=str))
     log.info(f"Wrote {out_path}")
 
-    print("\n" + "=" * 60)
-    print(" LIVE CONFIG PROMOTED")
-    print("=" * 60)
-    print(f"  Source:        {cfg['meta']['source_sweep_csv']}")
-    print(f"  Promoted at:   {cfg['meta']['promoted_at_human']}")
-    print(f"  Fitness:       {cfg['meta'].get('fitness')}")
-    print(f"  Trades:        {cfg['meta'].get('trades')}")
-    print(f"  Win rate:      {cfg['meta'].get('win_rate')}%")
-    print(f"  Profit factor: {cfg['meta'].get('profit_factor')}")
-    print(f"  Expectancy_R:  {cfg['meta'].get('expectancy_R')}")
-    print(f"  Max DD:        {cfg['meta'].get('max_drawdown_pct')}%")
-    print("\n  Parameters:")
+    log.info("=" * 60)
+    log.info(" LIVE CONFIG PROMOTED")
+    log.info("=" * 60)
+    log.info(f"  Source:        {cfg['meta']['source_sweep_csv']}")
+    log.info(f"  Promoted at:   {cfg['meta']['promoted_at_human']}")
+    log.info(f"  Fitness:       {cfg['meta'].get('fitness')}")
+    log.info(f"  Trades:        {cfg['meta'].get('trades')}")
+    log.info(f"  Win rate:      {cfg['meta'].get('win_rate')}%")
+    log.info(f"  Profit factor: {cfg['meta'].get('profit_factor')}")
+    log.info(f"  Expectancy_R:  {cfg['meta'].get('expectancy_R')}")
+    log.info(f"  Max DD:        {cfg['meta'].get('max_drawdown_pct')}%")
+    log.info("  Parameters:")
     for k, v in cfg["params"].items():
-        print(f"    {k:>22}: {v}")
+        log.info(f"    {k:>22}: {v}")
     return cfg
 
 
@@ -254,30 +254,30 @@ def apply_live_config(module_name: str = "intraday_pattern_scanner_v2",
 
 def _cmd_show(path: Path):
     if not path.exists():
-        print(f"No live config at {path}. (Scanner uses hardcoded defaults.)")
+        log.info(f"No live config at {path}. (Scanner uses hardcoded defaults.)")
         return
     cfg = json.loads(path.read_text())
     age = _config_age_days(cfg)
-    print(f"\nLive config at: {path}")
-    print(f"Promoted at:    {cfg['meta'].get('promoted_at_human')}")
-    print(f"Age (days):     {age:.1f}" if age is not None else "Age: unknown")
-    print(f"Fitness:        {cfg['meta'].get('fitness')}")
-    print(f"Trades:         {cfg['meta'].get('trades')}")
-    print(f"Win rate:       {cfg['meta'].get('win_rate')}%")
-    print(f"Profit factor:  {cfg['meta'].get('profit_factor')}")
-    print(f"\nParameters:")
+    log.info(f"Live config at: {path}")
+    log.info(f"Promoted at:    {cfg['meta'].get('promoted_at_human')}")
+    log.info(f"Age (days):     {age:.1f}" if age is not None else "Age: unknown")
+    log.info(f"Fitness:        {cfg['meta'].get('fitness')}")
+    log.info(f"Trades:         {cfg['meta'].get('trades')}")
+    log.info(f"Win rate:       {cfg['meta'].get('win_rate')}%")
+    log.info(f"Profit factor:  {cfg['meta'].get('profit_factor')}")
+    log.info("Parameters:")
     for k, v in cfg.get("params", {}).items():
-        print(f"  {k:>22}: {v}")
+        log.info(f"  {k:>22}: {v}")
     if age is not None and age > MAX_AGE_DAYS:
-        print(f"\n⚠️  Config older than {MAX_AGE_DAYS} days — scanner will REJECT it.")
+        log.warning(f"Config older than {MAX_AGE_DAYS} days — scanner will REJECT it.")
 
 
 def _cmd_clear(path: Path):
     if path.exists():
         path.unlink()
-        print(f"Deleted {path}. Scanner uses hardcoded defaults.")
+        log.info(f"Deleted {path}. Scanner uses hardcoded defaults.")
     else:
-        print("Nothing to delete.")
+        log.info("Nothing to delete.")
 
 
 def main():

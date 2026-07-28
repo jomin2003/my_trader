@@ -120,12 +120,13 @@ _SCANNER_ATTRS = [
 
 
 class ScannerConfig:
-    """Context manager: temporarily override scanner constants."""
+    """Context manager: temporarily override scanner constants (thread-safe)."""
     def __init__(self, **overrides):
         self.overrides = {k: v for k, v in overrides.items() if k in _SCANNER_ATTRS}
         self.original = {}
 
     def __enter__(self):
+        scn._CONFIG_LOCK.acquire()
         for k, v in self.overrides.items():
             self.original[k] = getattr(scn, k)
             setattr(scn, k, v)
@@ -134,6 +135,7 @@ class ScannerConfig:
     def __exit__(self, *exc):
         for k, v in self.original.items():
             setattr(scn, k, v)
+        scn._CONFIG_LOCK.release()
 
 
 # =====================================================================

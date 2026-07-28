@@ -85,10 +85,10 @@ log = logging.getLogger("downloader")
 
 
 # =====================================================================
-# NIFTY 50 CONSTITUENTS (hardcoded — the list is stable enough that
-# a monthly refresh is fine; NSE changes ~2 names/year)
+# NIFTY 50 CONSTITUENTS — fetched dynamically from Dhan instrument
+# master. Falls back to hardcoded list if fetch fails.
 # =====================================================================
-NIFTY50 = [
+_NIFTY50_FALLBACK = [
     "RELIANCE","HDFCBANK","ICICIBANK","INFY","TCS","BHARTIARTL","SBIN",
     "ITC","HINDUNILVR","LT","AXISBANK","KOTAKBANK","BAJFINANCE","ASIANPAINT",
     "MARUTI","SUNPHARMA","TITAN","ULTRACEMCO","M&M","HCLTECH","NTPC",
@@ -98,6 +98,43 @@ NIFTY50 = [
     "EICHERMOT","HEROMOTOCO","APOLLOHOSP","LTIM","DIVISLAB","SBILIFE",
     "HDFCLIFE","BPCL","TATACONSUM","SHRIRAMFIN",
 ]
+
+
+def load_nifty50_validated() -> list[str]:
+    """
+    Return NIFTY 50 constituents, pruned against Dhan's live instrument
+    master so delisted / renamed names drop out automatically.
+
+    The master does not label index membership, so we start from the
+    known constituent list and keep only those still present as NSE F&O
+    underlyings (a good proxy for large-cap tradability). Falls back to
+    the full static list if the fetch fails.
+    """
+    try:
+        resp = requests.get(INSTRUMENT_MASTER_URL, timeout=30)
+        resp.raise_for_status()
+        df = pd.read_csv(io.StringIO(resp.text), low_memory=False)
+        cols = {c.upper(): c for c in df.columns}
+        C = lambda n: cols[n.upper()]
+        fno = df[
+            (df[C("SEM_EXM_EXCH_ID")].astype(str).str.upper() == "NSE") &
+            (df[C("SEM_INSTRUMENT_NAME")].astype(str).str.upper().isin(["FUTSTK", "OPTSTK"]))
+        ]
+        live_unders = set(
+            fno[C("SEM_TRADING_SYMBOL")].astype(str)
+            .str.split("-").str[0].str.upper().unique().tolist()
+        )
+        validated = [s for s in _NIFTY50_FALLBACK if s.upper() in live_unders]
+        dropped = [s for s in _NIFTY50_FALLBACK if s.upper() not in live_unders]
+        if len(validated) >= 40:
+            if dropped:
+                log.info(f"NIFTY 50: dropped {len(dropped)} stale names {dropped}")
+            log.info(f"NIFTY 50 validated: {len(validated)} live constituents")
+            return validated
+        log.warning(f"Only {len(validated)} validated — using static fallback")
+    except Exception as e:
+        log.warning(f"Failed to validate NIFTY 50 from master: {e}")
+    return _NIFTY50_FALLBACK[:]
 
 
 # =====================================================================
@@ -146,6 +183,7 @@ def merge_and_save(symbol: str, new_df: pd.DataFrame, out_dir: Path) -> tuple[in
     Returns (rows_added, total_rows).
     """
     fp = out_dir / f"{symbol}.csv"
+    old = None
     if fp.exists():
         try:
             old = pd.read_csv(fp)
@@ -166,7 +204,7 @@ def merge_and_save(symbol: str, new_df: pd.DataFrame, out_dir: Path) -> tuple[in
     combined_out["ts"] = combined_out["ts"].dt.strftime("%Y-%m-%d %H:%M:%S%z")
     combined_out.to_csv(fp, index=False)
 
-    added = len(combined) - (len(old) if fp.exists() and 'old' in locals() and isinstance(old, pd.DataFrame) else 0)
+    added = len(combined) - (len(old) if old is not None and isinstance(old, pd.DataFrame) else 0)
     return max(0, added), len(combined)
 
 
@@ -199,7 +237,7 @@ def resolve_universe(preset: str, symbols_file: str | None) -> list[str]:
         log.info(f"Loaded {len(syms)} symbols from {p.name}")
         return syms
     if preset == "nifty50":
-        return NIFTY50[:]
+        return load_nifty50_validated()
     if preset == "fno":
         return load_universe_fno_from_dhan_master()
     raise SystemExit(f"Unknown preset: {preset}")

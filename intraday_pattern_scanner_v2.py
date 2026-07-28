@@ -26,6 +26,7 @@ import io
 import os
 import time
 import logging
+import threading
 from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
 
@@ -80,6 +81,9 @@ _NIFTY_INSTR_TYPE     = "INDEX"
 REQUEST_SLEEP_SEC     = 0.22
 BACKOFF_ON_ERROR_SEC  = 2.0
 
+# Thread-safety: lock protects config globals during monkey-patch from live_config/param_sweep
+_CONFIG_LOCK = threading.Lock()
+
 IST             = ZoneInfo("Asia/Kolkata")
 MARKET_OPEN     = dtime(9, 15)
 SCAN_START      = dtime(9, 30)
@@ -87,6 +91,17 @@ NO_ENTRY_AFTER  = dtime(14, 30)
 MARKET_CLOSE    = dtime(15, 20)
 
 POSITION_POLL_SEC     = 20
+OCO_TIMEOUT_SEC       = 300
+FORCE_EXIT_TIME       = dtime(15, 15)
+
+# Trailing stop and partial profit-taking
+TRAILING_STOP_ENABLED = True
+TRAILING_ATR_MULT     = 1.0       # trail distance = this * ATR
+TRAIL_ACTIVATE_R      = 1.0       # activate trail after 1R in profit
+PARTIAL_EXIT_ENABLED  = True
+PARTIAL_EXIT_R        = 1.0       # take partial at 1R
+PARTIAL_EXIT_FRACTION = 0.5       # exit 50% of position
+
 INSTRUMENT_MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
 
 logging.basicConfig(level=logging.INFO,
@@ -234,6 +249,41 @@ def ema(series, span):
     return float(series.ewm(span=span,adjust=False).mean().iloc[-1])
 
 
+def adx(df, period=14):
+    """Compute ADX (Average Directional Index). Returns ADX value or None."""
+    if len(df) < period * 2:
+        return None
+    h = df["high"].values.astype(float)
+    l = df["low"].values.astype(float)
+    c = df["close"].values.astype(float)
+    prev_h = np.concatenate([[h[0]], h[:-1]])
+    prev_l = np.concatenate([[l[0]], l[:-1]])
+    prev_c = np.concatenate([[c[0]], c[:-1]])
+    tr = np.maximum.reduce([h - l, np.abs(h - prev_c), np.abs(l - prev_c)])
+    plus_dm = np.where((h - prev_h) > (prev_l - l), np.maximum(h - prev_h, 0), 0.0)
+    minus_dm = np.where((prev_l - l) > (h - prev_h), np.maximum(prev_l - l, 0), 0.0)
+    # Wilder smoothing
+    atr_s = np.zeros_like(tr); atr_s[period-1] = tr[:period].mean()
+    pdm_s = np.zeros_like(tr); pdm_s[period-1] = plus_dm[:period].mean()
+    ndm_s = np.zeros_like(tr); ndm_s[period-1] = minus_dm[:period].mean()
+    for i in range(period, len(tr)):
+        atr_s[i] = (atr_s[i-1] * (period - 1) + tr[i]) / period
+        pdm_s[i] = (pdm_s[i-1] * (period - 1) + plus_dm[i]) / period
+        ndm_s[i] = (ndm_s[i-1] * (period - 1) + minus_dm[i]) / period
+    with np.errstate(divide='ignore', invalid='ignore'):
+        plus_di = 100.0 * pdm_s / np.where(atr_s > 0, atr_s, 1e-9)
+        minus_di = 100.0 * ndm_s / np.where(atr_s > 0, atr_s, 1e-9)
+        dx = 100.0 * np.abs(plus_di - minus_di) / np.where(plus_di + minus_di > 0, plus_di + minus_di, 1e-9)
+    adx_arr = np.zeros_like(dx)
+    start = 2 * period - 1
+    if start >= len(dx):
+        return None
+    adx_arr[start] = dx[period:start+1].mean()
+    for i in range(start + 1, len(dx)):
+        adx_arr[i] = (adx_arr[i-1] * (period - 1) + dx[i]) / period
+    return float(adx_arr[-1]) if adx_arr[-1] > 0 else None
+
+
 def detect_patterns(df): return []       # replaced at import
 def score_signals(symbol, security_id, df, hits): return []   # replaced at import
 
@@ -241,15 +291,10 @@ def score_signals(symbol, security_id, df, hits): return []   # replaced at impo
 # =====================================================================
 # STRATEGY OVERRIDE — 4 strategies via multi_strategy_live
 # =====================================================================
-try:
-    import multi_strategy_live
-    detect_patterns = multi_strategy_live.detect_patterns
-    score_signals   = multi_strategy_live.score_signals
-    log.info("[SCANNER] Multi-strategy active: OB Shorts + ORB + Gap-Fill + Candle-Struct")
-except ImportError as e:
-    log.warning(f"[SCANNER] multi_strategy_live not found ({e}) — no signals will fire")
-except Exception as e:
-    log.error(f"[SCANNER] multi wire-in failed: {e}")
+import multi_strategy_live
+detect_patterns = multi_strategy_live.detect_patterns
+score_signals   = multi_strategy_live.score_signals
+log.info("[SCANNER] Multi-strategy active: OB Shorts + ORB + Gap-Fill + Candle-Struct")
 
 
 # =====================================================================
@@ -257,6 +302,29 @@ except Exception as e:
 # =====================================================================
 _OPEN_POSITIONS: dict[str, dict] = {}
 _TRADED_TODAY:  set[str]        = set()
+_COMPLETED_TRADES: list[dict]   = []
+
+
+def get_daily_pnl_summary() -> str:
+    if not _COMPLETED_TRADES:
+        return "No completed trades today."
+    total_pnl = sum(t["pnl"] for t in _COMPLETED_TRADES)
+    wins = [t for t in _COMPLETED_TRADES if t["pnl"] > 0]
+    losses = [t for t in _COMPLETED_TRADES if t["pnl"] <= 0]
+    win_rate = len(wins) / len(_COMPLETED_TRADES) * 100 if _COMPLETED_TRADES else 0
+    lines = [
+        f"📊 <b>DAILY P&L SUMMARY</b>",
+        f"Trades: {len(_COMPLETED_TRADES)} | W:{len(wins)} L:{len(losses)}",
+        f"Win rate: {win_rate:.0f}%",
+        f"Net P&L: ₹{total_pnl:+,.2f}",
+    ]
+    if wins:
+        lines.append(f"Best win: ₹{max(t['pnl'] for t in wins):+,.2f}")
+    if losses:
+        lines.append(f"Worst loss: ₹{min(t['pnl'] for t in losses):+,.2f}")
+    for t in _COMPLETED_TRADES:
+        lines.append(f"  {t['symbol']} [{t['strategy']}] {t['outcome']}: ₹{t['pnl']:+,.2f}")
+    return "\n".join(lines)
 
 
 def compute_sl_target(entry, direction, atr_val):
@@ -363,25 +431,133 @@ def place_bracket_orders(dhan, sig):
         log.error(f"[{symbol}] TGT fail: {e}"); tg_send(f"⚠️ TGT failed {symbol}: {e}")
 
     _OPEN_POSITIONS[symbol]={"entry_id":entry_id,"sl_id":sl_id,"tgt_id":tgt_id,"qty":qty,
-        "entry":entry_px,"sl":sl_px,"target":tgt_px,"side":side,"opened_at":now_ist(),"strategy":strat}
+        "entry":entry_px,"sl":sl_px,"target":tgt_px,"side":side,"opened_at":now_ist(),
+        "strategy":strat,"security_id":sec_id,"atr":atr_val,"partial_done":False}
     _TRADED_TODAY.add(symbol)
     tg_send(f"✅ <b>ORDER PLACED</b> [{strat}] {sig['pattern']}\n"
             f"<b>{symbol}</b> {side} ×{qty}\nEntry~₹{entry_px}  SL ₹{sl_px}  🎯 ₹{tgt_px}\n"
             f"IDs: {entry_id} / {sl_id} / {tgt_id}")
 
 
+def _update_trailing_stop(dhan, sym, pos, current_price):
+    """Move SL toward price when position moves in our favor past TRAIL_ACTIVATE_R."""
+    if not TRAILING_STOP_ENABLED:
+        return
+    entry = pos["entry"]; sl_dist = abs(entry - pos["sl"])
+    direction = 1 if pos["side"] == "BUY" else -1
+    profit = (current_price - entry) * direction
+    if profit < TRAIL_ACTIVATE_R * sl_dist:
+        return
+    atr_trail = pos.get("atr", sl_dist) * TRAILING_ATR_MULT
+    if direction > 0:
+        new_sl = round(current_price - atr_trail, 2)
+        if new_sl <= pos["sl"]:
+            return
+    else:
+        new_sl = round(current_price + atr_trail, 2)
+        if new_sl >= pos["sl"]:
+            return
+    # Cancel old SL and place new one
+    _cancel(dhan, pos["sl_id"])
+    exit_side = "SELL" if pos["side"] == "BUY" else "BUY"
+    try:
+        sl_resp = dhan.place_order(
+            security_id=pos.get("security_id", ""),
+            exchange_segment=getattr(dhan, "NSE", "NSE_EQ"),
+            transaction_type=getattr(dhan, exit_side, exit_side),
+            quantity=pos["qty"],
+            product_type=getattr(dhan, "INTRA", "INTRADAY"),
+            order_type=getattr(dhan, "SLM", "STOP_LOSS_MARKET"),
+            price=0, trigger_price=new_sl)
+        pos["sl_id"] = _order_id(sl_resp)
+        pos["sl"] = new_sl
+        log.info(f"[{sym}] Trailing SL moved to ₹{new_sl}")
+    except Exception as e:
+        log.warning(f"[{sym}] Trailing SL update failed: {e}")
+
+
+def _partial_exit(dhan, sym, pos, current_price):
+    """Exit a fraction of position when profit reaches PARTIAL_EXIT_R."""
+    if not PARTIAL_EXIT_ENABLED or pos.get("partial_done"):
+        return
+    entry = pos["entry"]; sl_dist = abs(entry - pos["sl"])
+    direction = 1 if pos["side"] == "BUY" else -1
+    profit = (current_price - entry) * direction
+    if profit < PARTIAL_EXIT_R * sl_dist:
+        return
+    exit_qty = max(1, int(pos["qty"] * PARTIAL_EXIT_FRACTION))
+    remaining = pos["qty"] - exit_qty
+    if remaining <= 0:
+        return
+    exit_side = "SELL" if pos["side"] == "BUY" else "BUY"
+    try:
+        dhan.place_order(
+            security_id=pos.get("security_id", ""),
+            exchange_segment=getattr(dhan, "NSE", "NSE_EQ"),
+            transaction_type=getattr(dhan, exit_side, exit_side),
+            quantity=exit_qty,
+            product_type=getattr(dhan, "INTRA", "INTRADAY"),
+            order_type=getattr(dhan, "MARKET", "MARKET"),
+            price=0)
+        pos["qty"] = remaining
+        pos["partial_done"] = True
+        tg_send(f"📊 Partial exit {exit_qty} of <b>{sym}</b> @ ~₹{current_price} [{pos.get('strategy','?')}]")
+        log.info(f"[{sym}] Partial exit {exit_qty} units, {remaining} remaining")
+    except Exception as e:
+        log.warning(f"[{sym}] Partial exit failed: {e}")
+
+
 def monitor_oco(dhan):
     if not _OPEN_POSITIONS: return
     done=[]
+    now = now_ist()
+    force_exit = now.time() >= FORCE_EXIT_TIME
     for sym,pos in list(_OPEN_POSITIONS.items()):
+        # Force-cancel all exits near market close
+        if force_exit:
+            _cancel(dhan, pos["sl_id"]); _cancel(dhan, pos["tgt_id"])
+            tg_send(f"⏰ Force-exit near close: <b>{sym}</b> [{pos.get('strategy','?')}]")
+            done.append(sym); continue
+        # Timeout: if position open too long, warn
+        opened = pos.get("opened_at")
+        if opened and (now - opened).total_seconds() > OCO_TIMEOUT_SEC:
+            log.warning(f"[{sym}] OCO open >{OCO_TIMEOUT_SEC}s — checking status")
         sl_st=_order_status(dhan,pos["sl_id"]) if pos["sl_id"] else ""
         tgt_st=_order_status(dhan,pos["tgt_id"]) if pos["tgt_id"] else ""
         if any(k in sl_st for k in ("TRADED","EXECUTED","FILLED")):
-            _cancel(dhan,pos["tgt_id"]); tg_send(f"🛑 SL hit: <b>{sym}</b> @ ₹{pos['sl']} [{pos.get('strategy','?')}]"); done.append(sym)
+            _cancel(dhan,pos["tgt_id"])
+            pnl = (pos["sl"] - pos["entry"]) * pos["qty"] * (1 if pos["side"]=="BUY" else -1)
+            _COMPLETED_TRADES.append({"symbol":sym,"strategy":pos.get("strategy","?"),
+                "outcome":"SL","pnl":round(pnl,2),"entry":pos["entry"],"exit":pos["sl"]})
+            tg_send(f"🛑 SL hit: <b>{sym}</b> @ ₹{pos['sl']} [{pos.get('strategy','?')}] P&L: ₹{pnl:+,.2f}")
+            done.append(sym)
         elif any(k in tgt_st for k in ("TRADED","EXECUTED","FILLED")):
-            _cancel(dhan,pos["sl_id"]); tg_send(f"🎉 Target hit: <b>{sym}</b> @ ₹{pos['target']} [{pos.get('strategy','?')}]"); done.append(sym)
+            _cancel(dhan,pos["sl_id"])
+            pnl = (pos["target"] - pos["entry"]) * pos["qty"] * (1 if pos["side"]=="BUY" else -1)
+            _COMPLETED_TRADES.append({"symbol":sym,"strategy":pos.get("strategy","?"),
+                "outcome":"TARGET","pnl":round(pnl,2),"entry":pos["entry"],"exit":pos["target"]})
+            tg_send(f"🎉 Target hit: <b>{sym}</b> @ ₹{pos['target']} [{pos.get('strategy','?')}] P&L: ₹{pnl:+,.2f}")
+            done.append(sym)
         elif "REJECTED" in sl_st and "REJECTED" in tgt_st:
             tg_send(f"⚠️ Both exits rejected {sym}, cleaning up"); done.append(sym)
+        else:
+            # Trailing stop + partial profit on open positions
+            try:
+                today = now.strftime("%Y-%m-%d")
+                sec_id = pos.get("security_id", "")
+                if sec_id:
+                    resp = dhan.intraday_minute_data(
+                        security_id=sec_id, exchange_segment="NSE_EQ",
+                        instrument_type="EQUITY", from_date=today,
+                        to_date=today, interval=CANDLE_INTERVAL_MIN)
+                    data = resp.get("data", resp) if isinstance(resp, dict) else {}
+                    if isinstance(data, dict) and data.get("close"):
+                        ltp = float(data["close"][-1])
+                        if AUTO_TRADE_ENABLED:
+                            _partial_exit(dhan, sym, pos, ltp)
+                            _update_trailing_stop(dhan, sym, pos, ltp)
+            except Exception as e:
+                log.debug(f"[{sym}] trail/partial check: {e}")
     for sym in done: _OPEN_POSITIONS.pop(sym, None)
 
 
@@ -455,8 +631,8 @@ def run():
                 ranked=scan_once(dhan,universe)
                 if not ranked.empty:
                     all_signals.append(ranked)
-                    print(f"\n=== Signals @ {now.strftime('%H:%M')} ===")
-                    print(ranked.head(TOP_N_RESULTS).to_string(index=False))
+                    log.info(f"\n=== Signals @ {now.strftime('%H:%M')} ===")
+                    log.info(ranked.head(TOP_N_RESULTS).to_string(index=False))
                     act_on_signals(dhan,ranked)
             except Exception as e:
                 log.exception("scan error"); tg_send(f"⚠️ Scan error: {e}")
@@ -477,6 +653,9 @@ def run():
             tg_send(f"📈 <b>EOD</b>: {len(combined)} signals | traded {len(_TRADED_TODAY)}")
     else:
         tg_send("ℹ️ EOD: no actionable signals today.")
+    # Daily P&L summary
+    tg_send(get_daily_pnl_summary())
+    _COMPLETED_TRADES.clear()
 
 
 if __name__ == "__main__":

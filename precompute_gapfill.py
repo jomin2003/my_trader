@@ -1,9 +1,12 @@
 """Precompute Gap-Fill metadata per (symbol, date). Keeps gaps 1.0%-3.0%."""
 from __future__ import annotations
 import argparse
+import logging
 from pathlib import Path
 import numpy as np
 import pandas as pd
+
+log = logging.getLogger("precompute_gap")
 
 GAP_MIN = 1.0
 GAP_MAX = 3.0
@@ -72,16 +75,16 @@ def main():
             df = df.dropna(subset=["open","high","low","close"])
             df = df[df["volume"] > 0].sort_values("ts").reset_index(drop=True)
         except Exception as e:
-            print(f"  Skip {fp.name}: {e}"); continue
+            log.warning(f"Skip {fp.name}: {e}"); continue
         if df.empty: continue
         rows = process_symbol(df, sym)
         all_rows.extend(rows)
-        if rows: print(f"  {sym}: {len(rows)} gap-days")
+        if rows: log.info(f"  {sym}: {len(rows)} gap-days")
     if not all_rows: raise SystemExit("No tradeable gaps (1-3%) found.")
     out_df = pd.DataFrame(all_rows)
     out_df.to_csv(Path(args.out).expanduser().resolve(), index=False)
-    print(f"\nSaved {len(out_df)} gap-days | UP:{(out_df['gap_dir']=='UP').sum()} "
-          f"DOWN:{(out_df['gap_dir']=='DOWN').sum()}")
+    log.info(f"Saved {len(out_df)} gap-days | UP:{(out_df['gap_dir']=='UP').sum()} "
+             f"DOWN:{(out_df['gap_dir']=='DOWN').sum()}")
 
 
 if __name__ == "__main__":
