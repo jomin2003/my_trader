@@ -5,14 +5,14 @@ CHANGES vs previous:
   - NEW: /report + /pnl Telegram commands -> live day's-PnL report.
   - NEW: POST /trigger/report endpoint (cron at 15:40 IST) -> pushes the
          day's report to Telegram.
+  - NEW: /status shows the Kronos forecast summary (kronos_gate).
   - /resume now also clears the scanner's AUTO-halt (circuit breaker).
-  - /status shows auto-halt state + open positions.
   - Day-boundary calls scn.reset_day() (clears signals/trades/positions/halts).
   - Background-thread scans (no cron timeout), universe cached per day,
     overlap guard on scans.
 
 Telegram commands (type in your bot chat):
-  /status  -> full live status (scans, token, market, open pos, halt state)
+  /status  -> full live status (scans, token, market, open pos, halt, Kronos)
   /report  -> today's trades + suggestions + realised + floating P&L
   /pnl     -> alias of /report
   /health  -> quick alive check
@@ -207,6 +207,12 @@ def _get_universe(scn):
             scn.reset_day()   # clears signals, trades, positions, halts, cooldowns
         except Exception as e:
             log.warning(f"reset_day failed: {e}")
+        # refresh Kronos forecast at the day boundary too
+        try:
+            import kronos_gate
+            kronos_gate.reload_forecast()
+        except Exception:
+            pass
     return _UNIVERSE
 
 def _run_module(script: str, args: list, timeout: int) -> int:
@@ -331,6 +337,12 @@ def _build_status_text() -> str:
         f"Last scan: {STATE['last_scan']}",
         f"Last report: {STATE['last_report']}",
     ]
+    # Kronos forecast summary (no-op if gate/forecast unavailable)
+    try:
+        import kronos_gate
+        lines.append(kronos_gate.kronos_summary())
+    except Exception:
+        pass
     if STATE["errors_last_10"]:
         lines.append(f"Recent errors: {len(STATE['errors_last_10'])}")
     return "\n".join(lines)
@@ -377,7 +389,7 @@ def telegram_webhook():
         elif cmd == "help":
             tg_send_to(chat_id,
                 "Commands:\n"
-                "/status — live status + halt state\n"
+                "/status — live status + halt + Kronos\n"
                 "/report — today's P&L + trades + suggestions\n"
                 "/pnl — same as /report\n"
                 "/stop — halt order placement\n"
@@ -425,6 +437,12 @@ def status():
         auto_halt, halt_reason = scn.halt_status()
     except Exception:
         pass
+    kronos_info = None
+    try:
+        import kronos_gate
+        kronos_info = kronos_gate.kronos_summary()
+    except Exception:
+        pass
     return jsonify({
         "time_ist":           now_ist().isoformat(),
         "in_market_hours":    MARKET_OPEN <= now_ist().time() <= MARKET_CLOSE,
@@ -436,6 +454,7 @@ def status():
         "manual_halt":        STATE["trading_halted"],
         "auto_halt":          auto_halt,
         "auto_halt_reason":   halt_reason,
+        "kronos":             kronos_info,
         "state":              STATE,
     })
 
