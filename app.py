@@ -1,28 +1,36 @@
 """
 FLASK WEB SERVICE for Render FREE TIER + external cron + TELEGRAM COMMANDS
-
+=========================================================================
 CHANGES vs previous:
-  * NEW: /telegram/webhook endpoint — lets you type /status, /health, /help
-    directly in Telegram and get a live reply.
-  * Background-thread scans (no cron timeout)
-  * Universe cached per day
-  * Overlap guard on scans
+  - NEW: /report + /pnl Telegram commands -> live day's-PnL report.
+  - NEW: POST /trigger/report endpoint (cron at 15:40 IST) -> pushes the
+         day's report to Telegram.
+  - /resume now also clears the scanner's AUTO-halt (circuit breaker).
+  - /status shows auto-halt state + open positions.
+  - Day-boundary calls scn.reset_day() (clears signals/trades/positions/halts).
+  - Background-thread scans (no cron timeout), universe cached per day,
+    overlap guard on scans.
 
 Telegram commands (type in your bot chat):
-  /status  -> full live status (scans, token, market state, last signal)
+  /status  -> full live status (scans, token, market, open pos, halt state)
+  /report  -> today's trades + suggestions + realised + floating P&L
+  /pnl     -> alias of /report
   /health  -> quick alive check
+  /stop    -> halt order placement (kill switch)
+  /resume  -> re-enable order placement (also clears auto-halt)
   /help    -> list commands
 
 Endpoints:
   GET  /                    - status page
   GET  /healthz             - keep-alive ping
   GET  /status              - JSON state dump
-  POST /telegram/webhook    - Telegram command handler  (NEW)
+  POST /telegram/webhook    - Telegram command handler
   POST /trigger/refresh     - refresh Dhan token
   POST /trigger/scan        - fire-and-forget scan
   POST /trigger/oco         - fire-and-forget OCO check
   POST /trigger/download    - append bars + refresh OB data
   POST /trigger/promote     - promote latest sweep
+  POST /trigger/report      - push today's P&L report to Telegram
 """
 from __future__ import annotations
 
@@ -78,28 +86,27 @@ STATE = {
     "last_scan_result":   None,
     "last_download":      None,
     "last_token_refresh": None,
+    "last_report":        None,
     "scans_today":        0,
     "signals_today":      0,
     "orders_today":       0,
     "scan_running":       False,
+    "trading_halted":     False,   # manual /stop kill switch
     "errors_last_10":     [],
 }
 
 _UNIVERSE = None
 _UNIVERSE_DATE = None
 _SCAN_LOCK = threading.Lock()
-_TG_RATE: dict[str, list[float]] = {}  # chat_id -> list of timestamps
+_TG_RATE: dict[str, list[float]] = {}   # chat_id -> list of timestamps
 _TG_RATE_LIMIT = 10  # max requests per 60 seconds
-
 
 def now_ist() -> datetime:
     return datetime.now(IST)
 
-
 def _record_error(msg: str):
     STATE["errors_last_10"].append({"t": now_ist().isoformat(), "msg": msg[:400]})
     STATE["errors_last_10"] = STATE["errors_last_10"][-10:]
-
 
 def tg_send(text: str, silent: bool = False):
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
@@ -109,25 +116,28 @@ def tg_send(text: str, silent: bool = False):
             f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
             json={"chat_id": TG_CHAT_ID, "text": text[:4000],
                   "parse_mode": "HTML", "disable_notification": silent},
-            timeout=5,
-        )
+            timeout=5)
     except Exception:
         pass
 
-
 def tg_send_to(chat_id: str, text: str):
-    """Send to a specific chat (used by webhook replies)."""
+    "Send to a specific chat (used by webhook replies)."
     if not TG_BOT_TOKEN:
         return
     try:
         requests.post(
             f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
             json={"chat_id": chat_id, "text": text[:4000], "parse_mode": "HTML"},
-            timeout=5,
-        )
+            timeout=5)
     except Exception:
         pass
 
+def _tg_rate_ok(chat_id: str) -> bool:
+    now = time.time()
+    hits = [t for t in _TG_RATE.get(chat_id, []) if now - t < 60]
+    hits.append(now)
+    _TG_RATE[chat_id] = hits
+    return len(hits) <= _TG_RATE_LIMIT
 
 def require_cron_secret(f):
     @wraps(f)
@@ -139,10 +149,6 @@ def require_cron_secret(f):
             return jsonify({"error": "unauthorized"}), 401
         return f(*a, **kw)
     return _wrap
-
-
-_TRADING_HALTED = False
-
 
 def boot_restore():
     log.info("=" * 50)
@@ -166,10 +172,8 @@ def boot_restore():
         _record_error(f"boot token: {e}")
     tg_send(f"🟢 App booted on Render at {now_ist():%H:%M IST}", silent=True)
 
-
 _DHAN = None
 _DHAN_LOCK = threading.Lock()
-
 
 def get_dhan():
     global _DHAN
@@ -179,14 +183,12 @@ def get_dhan():
             cid = os.getenv("DHAN_CLIENT_ID", "")
             tok = os.getenv("DHAN_ACCESS_TOKEN", "")
             _DHAN = dhanhq(DhanContext(cid, tok))
-        return _DHAN
-
+    return _DHAN
 
 def reset_dhan():
     global _DHAN
     with _DHAN_LOCK:
         _DHAN = None
-
 
 def _get_universe(scn):
     global _UNIVERSE, _UNIVERSE_DATE
@@ -195,16 +197,17 @@ def _get_universe(scn):
         _UNIVERSE = scn.load_intraday_universe()
         _UNIVERSE_DATE = today
         log.info(f"Universe cached: {len(_UNIVERSE)} stocks for {today}")
-        # Day-boundary: clear strategy caches and traded-today sets
         try:
             import multi_strategy_live
             multi_strategy_live.clear_cache()
             log.info("Day-boundary: strategy caches cleared")
         except Exception:
             pass
-        scn._TRADED_TODAY.clear()
+        try:
+            scn.reset_day()   # clears signals, trades, positions, halts, cooldowns
+        except Exception as e:
+            log.warning(f"reset_day failed: {e}")
     return _UNIVERSE
-
 
 def _run_module(script: str, args: list, timeout: int) -> int:
     log.info(f"Running: python {script} {' '.join(args)}")
@@ -212,8 +215,7 @@ def _run_module(script: str, args: list, timeout: int) -> int:
         p = subprocess.run(
             [sys.executable, script, *args],
             cwd=str(BASE_DIR), capture_output=True, text=True, timeout=timeout,
-            env={**os.environ, "PYTHONUNBUFFERED": "1"},
-        )
+            env={**os.environ, "PYTHONUNBUFFERED": "1"})
         if p.returncode != 0:
             log.error(f"{script} rc={p.returncode}\n{p.stderr[-800:]}")
         return p.returncode
@@ -223,7 +225,6 @@ def _run_module(script: str, args: list, timeout: int) -> int:
     except Exception as e:
         log.error(f"{script} crashed: {e}")
         return -2
-
 
 # =====================================================================
 # BACKGROUND WORKERS
@@ -252,11 +253,11 @@ def _scan_worker():
         signals_count = len(ranked) if ranked is not None and not ranked.empty else 0
         STATE["signals_today"] += signals_count
         if ranked is not None and not ranked.empty and SCAN_START <= t <= NO_ENTRY_AFTER:
-            if not _TRADING_HALTED:
+            if not STATE["trading_halted"]:
                 scn.act_on_signals(dhan, ranked)
                 STATE["orders_today"] += int((ranked["score"] >= scn.MIN_SCORE_TO_TRADE).sum())
             else:
-                log.info("Trading halted — skipping order placement")
+                log.info("Trading halted (manual) — skipping order placement")
         try:
             scn.monitor_oco(dhan)
         except Exception as e:
@@ -266,11 +267,10 @@ def _scan_worker():
     except Exception as e:
         _record_error(f"scan: {e}")
         STATE["last_scan_result"] = f"error: {str(e)[:100]}"
-        tg_send(f"⚠️ Scan error: <code>{str(e)[:200]}</code>")
+        tg_send(f"⚠️ Scan error: {str(e)[:200]}")
     finally:
         STATE["scan_running"] = False
         _SCAN_LOCK.release()
-
 
 def _oco_worker():
     try:
@@ -282,110 +282,113 @@ def _oco_worker():
     except Exception as e:
         _record_error(f"oco: {e}")
 
+def _report_worker():
+    try:
+        import intraday_pattern_scanner_v2 as scn
+        report = scn.build_daily_report()
+        tg_send(report)
+        STATE["last_report"] = now_ist().isoformat()
+        log.info("Daily report sent to Telegram")
+    except Exception as e:
+        _record_error(f"report: {e}")
+        tg_send(f"⚠️ Report failed: {str(e)[:200]}")
 
 # =====================================================================
-# TELEGRAM COMMAND HANDLER (NEW)
+# TELEGRAM COMMAND HANDLER
 # =====================================================================
 def _build_status_text() -> str:
-    """Human-readable status for Telegram /status command."""
+    "Human-readable status for Telegram /status command."
     t = now_ist()
     in_market = MARKET_OPEN <= t.time() <= MARKET_CLOSE
     in_entry  = SCAN_START <= t.time() <= NO_ENTRY_AFTER
-
-    # Token
-    token_line = "unknown"
+    token_hours_left = None
     try:
         from dhan_token_manager import load_token
         tok = load_token()
         if tok:
-            token_line = f"{tok.hours_left:.1f}h left"
+            token_hours_left = round(tok.hours_left, 2)
     except Exception:
         pass
-
-    live_cfg = "active" if (BASE_DIR / "live_config.json").exists() else "hardcoded defaults"
-    ob_data  = "✅" if (BASE_DIR / "ob_data.csv").exists() else "❌ MISSING"
-
-    boot = STATE.get("boot_time_ist", "?")[:19].replace("T", " ")
-    last_scan = STATE.get("last_scan")
-    last_scan = last_scan[11:16] if last_scan else "none yet"
-    errors = STATE.get("errors_last_10", [])
-
+    n_open = 0
+    auto_halt = False; halt_reason = ""
+    try:
+        import intraday_pattern_scanner_v2 as scn
+        n_open = len(scn._OPEN_POSITIONS)
+        auto_halt, halt_reason = scn.halt_status()
+    except Exception:
+        pass
     lines = [
-        f"📊 <b>BOT STATUS</b> — {t:%H:%M:%S IST}",
-        f"",
-        f"🕐 Market open:    {'YES ✅' if in_market else 'NO (closed)'}",
-        f"🎯 Entry window:   {'YES ✅' if in_entry else 'NO'}",
-        f"🛑 Trading halted: {'YES ⛔' if _TRADING_HALTED else 'NO ✅'}",
-        f"🔑 Dhan token:     {token_line}",
-        f"⚙️  Live config:    {live_cfg}",
-        f"📁 OB data:        {ob_data}",
-        f"",
-        f"🔄 Scans today:    {STATE.get('scans_today', 0)}",
-        f"📶 Signals today:  {STATE.get('signals_today', 0)}",
-        f"🎯 Orders today:   {STATE.get('orders_today', 0)}",
-        f"⏱  Last scan:      {last_scan}",
-        f"📋 Last result:    {STATE.get('last_scan_result', 'none')}",
-        f"🏃 Scan running:   {'yes' if STATE.get('scan_running') else 'no'}",
-        f"",
-        f"🚀 Booted:         {boot}",
-        f"⚠️  Recent errors:  {len(errors)}",
+        f"🤖 <b>BOT STATUS</b> — {t:%d %b %H:%M IST}",
+        f"Market open: {'✅' if in_market else '❌'}",
+        f"Entry window: {'✅' if in_entry else '❌'}",
+        f"Manual halt: {'🛑 YES' if STATE['trading_halted'] else 'no'}",
+        f"Auto halt: {'⛔ ' + halt_reason if auto_halt else 'no'}",
+        f"Scan running: {'yes' if STATE['scan_running'] else 'no'}",
+        f"Scans today: {STATE['scans_today']}",
+        f"Signals today: {STATE['signals_today']}",
+        f"Open positions: {n_open}",
+        f"Token hours left: {token_hours_left}",
+        f"Last scan: {STATE['last_scan']}",
+        f"Last report: {STATE['last_report']}",
     ]
-    if errors:
-        last_err = errors[-1]
-        lines.append(f"   Latest: {last_err.get('msg', '')[:120]}")
+    if STATE["errors_last_10"]:
+        lines.append(f"Recent errors: {len(STATE['errors_last_10'])}")
     return "\n".join(lines)
-
 
 @app.route("/telegram/webhook", methods=["POST"])
 def telegram_webhook():
-    """Handles /status, /health, /help, /stop, /resume typed in Telegram."""
-    global _TRADING_HALTED
+    "Handles /status, /report, /pnl, /health, /help, /stop, /resume."
     try:
         update = request.get_json(force=True, silent=True) or {}
         msg = update.get("message") or update.get("edited_message") or {}
         chat = msg.get("chat", {})
         chat_id = str(chat.get("id", ""))
         text = (msg.get("text") or "").strip().lower()
-
-        # Only respond to the configured owner chat (security)
+        if not chat_id or not text:
+            return jsonify({"ok": True})
         if TG_CHAT_ID and chat_id != str(TG_CHAT_ID):
-            return "ok", 200
+            return jsonify({"ok": True})
+        if not _tg_rate_ok(chat_id):
+            return jsonify({"ok": True})
 
-        # Rate limiting
-        now = time.time()
-        history = _TG_RATE.get(chat_id, [])
-        history = [t for t in history if now - t < 60]
-        if len(history) >= _TG_RATE_LIMIT:
-            return "ok", 200
-        history.append(now)
-        _TG_RATE[chat_id] = history
+        cmd = text.split()[0].lstrip("/").split("@")[0]
 
-        if text.startswith("/status"):
+        if cmd == "health":
+            tg_send_to(chat_id, "✅ alive")
+        elif cmd == "status":
             tg_send_to(chat_id, _build_status_text())
-        elif text.startswith("/health"):
-            tg_send_to(chat_id, "✅ Bot is alive and responding.")
-        elif text.startswith("/stop"):
-            _TRADING_HALTED = True
-            tg_send_to(chat_id, "🛑 Trading HALTED. No new orders will be placed. Use /resume to restart.")
-            log.warning("Trading halted via Telegram /stop command")
-        elif text.startswith("/resume"):
-            _TRADING_HALTED = False
-            tg_send_to(chat_id, "▶️ Trading RESUMED. Orders will be placed again.")
-            log.info("Trading resumed via Telegram /resume command")
-        elif text.startswith("/help"):
+        elif cmd in ("report", "pnl"):
+            try:
+                import intraday_pattern_scanner_v2 as scn
+                tg_send_to(chat_id, scn.build_daily_report())
+            except Exception as e:
+                tg_send_to(chat_id, f"⚠️ Report error: {str(e)[:200]}")
+        elif cmd == "stop":
+            STATE["trading_halted"] = True
+            tg_send_to(chat_id, "🛑 Trading HALTED. Scans continue; no new orders.")
+        elif cmd == "resume":
+            STATE["trading_halted"] = False
+            try:
+                import intraday_pattern_scanner_v2 as scn
+                scn.resume_trading()   # also clears the circuit-breaker auto-halt
+            except Exception:
+                pass
+            tg_send_to(chat_id, "▶️ Trading RESUMED (manual + auto halt cleared).")
+        elif cmd == "help":
             tg_send_to(chat_id,
-                       "<b>Commands</b>\n"
-                       "/status — full live status\n"
-                       "/health — quick alive check\n"
-                       "/stop — halt all new orders\n"
-                       "/resume — resume trading\n"
-                       "/help — this message")
-        # ignore everything else silently
-        return "ok", 200
+                "Commands:\n"
+                "/status — live status + halt state\n"
+                "/report — today's P&L + trades + suggestions\n"
+                "/pnl — same as /report\n"
+                "/stop — halt order placement\n"
+                "/resume — re-enable orders (clears auto-halt)\n"
+                "/health — quick ping")
+        else:
+            tg_send_to(chat_id, "Unknown command. Try /help")
+        return jsonify({"ok": True})
     except Exception as e:
-        log.debug(f"webhook err: {e}")
-        return "ok", 200
-
+        _record_error(f"webhook: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 200
 
 # =====================================================================
 # HTTP ENDPOINTS
@@ -400,11 +403,9 @@ def index():
         "state":     STATE,
     })
 
-
 @app.route("/healthz")
 def healthz():
     return "ok", 200
-
 
 @app.route("/status")
 def status():
@@ -416,6 +417,14 @@ def status():
             token_hours_left = round(tok.hours_left, 2)
     except Exception:
         pass
+    n_open = 0
+    auto_halt = False; halt_reason = ""
+    try:
+        import intraday_pattern_scanner_v2 as scn
+        n_open = len(scn._OPEN_POSITIONS)
+        auto_halt, halt_reason = scn.halt_status()
+    except Exception:
+        pass
     return jsonify({
         "time_ist":           now_ist().isoformat(),
         "in_market_hours":    MARKET_OPEN <= now_ist().time() <= MARKET_CLOSE,
@@ -423,9 +432,12 @@ def status():
         "live_config_active": (BASE_DIR / "live_config.json").exists(),
         "ob_data_active":     (BASE_DIR / "ob_data.csv").exists(),
         "token_hours_left":   token_hours_left,
+        "open_positions":     n_open,
+        "manual_halt":        STATE["trading_halted"],
+        "auto_halt":          auto_halt,
+        "auto_halt_reason":   halt_reason,
         "state":              STATE,
     })
-
 
 @app.route("/trigger/refresh", methods=["POST", "GET"])
 @require_cron_secret
@@ -442,7 +454,6 @@ def trigger_refresh():
         tg_send(f"⚠️ Token refresh FAILED: {e}")
         return jsonify({"ok": False, "error": str(e)}), 500
 
-
 @app.route("/trigger/scan", methods=["POST", "GET"])
 @require_cron_secret
 def trigger_scan():
@@ -454,7 +465,6 @@ def trigger_scan():
     threading.Thread(target=_scan_worker, daemon=True).start()
     return jsonify({"ok": True, "note": "scan started in background"})
 
-
 @app.route("/trigger/oco", methods=["POST", "GET"])
 @require_cron_secret
 def trigger_oco():
@@ -464,18 +474,24 @@ def trigger_oco():
     threading.Thread(target=_oco_worker, daemon=True).start()
     return jsonify({"ok": True, "note": "oco check started"})
 
+@app.route("/trigger/report", methods=["POST", "GET"])
+@require_cron_secret
+def trigger_report():
+    "Push today's P&L report to Telegram (cron at ~15:40 IST)."
+    threading.Thread(target=_report_worker, daemon=True).start()
+    return jsonify({"ok": True, "note": "report started in background"})
 
 @app.route("/trigger/download", methods=["POST", "GET"])
 @require_cron_secret
 def trigger_download():
     def _dl():
         try:
-            rc1 = _run_module("csv_downloader.py",
-                              ["--mode", "dhan", "--preset", "nifty50",
-                               "--out", str(DATA_DIR)], timeout=600)
-            rc2 = _run_module("precompute_order_blocks.py",
-                              ["--csv-dir", str(DATA_DIR),
-                               "--out", str(BASE_DIR / "ob_data.csv")], timeout=300)
+            rc1 = _run_module("csv_downloader.py", [
+                "--mode", "dhan", "--preset", "nifty50",
+                "--out", str(DATA_DIR)], timeout=600)
+            rc2 = _run_module("precompute_order_blocks.py", [
+                "--csv-dir", str(DATA_DIR),
+                "--out", str(BASE_DIR / "ob_data.csv")], timeout=300)
             STATE["last_download"] = now_ist().isoformat()
             if rc1 != 0 or rc2 != 0:
                 tg_send(f"⚠️ Data pipeline: dl_rc={rc1}, ob_rc={rc2}")
@@ -487,7 +503,6 @@ def trigger_download():
     threading.Thread(target=_dl, daemon=True).start()
     return jsonify({"ok": True, "note": "download started in background"})
 
-
 @app.route("/trigger/promote", methods=["POST", "GET"])
 @require_cron_secret
 def trigger_promote():
@@ -495,8 +510,8 @@ def trigger_promote():
         sweeps = sorted(SW_DIR.glob("sweep_*.csv"), key=lambda p: p.stat().st_mtime)
         if not sweeps:
             return jsonify({"ok": False, "error": "no sweep files"}), 404
-        rc = _run_module("live_config.py",
-                         ["promote", "--sweep", str(sweeps[-1]), "--force"], timeout=60)
+        rc = _run_module("live_config.py", [
+            "promote", "--sweep", str(sweeps[-1]), "--force"], timeout=60)
         if rc == 0:
             try:
                 from gist_storage import backup_to_gist
@@ -507,10 +522,9 @@ def trigger_promote():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
-
 boot_restore()
-
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port, debug=False)
+
