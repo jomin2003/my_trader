@@ -1,6 +1,6 @@
 """
 =====================================================================
-DHAN INTRADAY SCANNER + AUTO-TRADER + TELEGRAM  (v4 — trades like a human)
+DHAN INTRADAY SCANNER + AUTO-TRADER + TELEGRAM  (v5 — Kronos-gated)
 =====================================================================
 Runs 4 strategies via multi_strategy_live.py:
   - OB SHORTS      - shooting star at bear OB zones (validated)
@@ -21,20 +21,24 @@ PROFIT-CAPTURE EXITS (v3):
   TIME_PROFIT - held too long AND in profit -> take what's there
   TIME_STALE  - held way too long -> cut it regardless
 
-HUMAN-LIKE DISCIPLINE (v4 — NEW):
-  * BREAKEVEN stop     - once +0.7R, move SL to entry (+buffer): never let a
-                         winner turn into a loser.
-  * DAILY CIRCUIT      - auto-halt for the day on max loss / max trades /
-                         consecutive losses (walk away on a bad day).
-  * LOSS COOLDOWN      - after a losing trade in a symbol, don't re-enter it
-                         for a while (no revenge trading).
+HUMAN-LIKE DISCIPLINE (v4):
+  * BREAKEVEN stop     - once +0.7R, move SL to entry (+buffer).
+  * DAILY CIRCUIT      - auto-halt on max loss / max trades / consecutive losses.
+  * LOSS COOLDOWN      - after a losing trade in a symbol, block re-entry a while.
   * UNREALISED P&L     - /report shows floating P&L on open positions.
 
-NEW: full trade blotter + DAILY REPORT (Telegram /report, /pnl, EOD push).
+KRONOS AI GATE (v5 — NEW):
+  * Reads a directional forecast (published to a Gist by a FREE GitHub
+    Actions job running the Kronos model) via kronos_gate.py.
+  * soft mode  -> +boost when Kronos agrees, -penalty when it disagrees.
+  * strict mode-> veto entries that a confident Kronos view opposes.
+  * If the forecast is missing/stale, the gate is a no-op (bot unaffected).
+
+DAILY REPORT (Telegram /report, /pnl, EOD push) with full blotter.
 
 AUTO_TRADE_ENABLED = False (paper trading). Keep False 2 weeks.
 Requires alongside this file: multi_strategy_live.py, structure_levels.py,
-ob_data.csv, gap_data.csv
+ob_data.csv, gap_data.csv  (kronos_gate.py optional but recommended)
 """
 from __future__ import annotations
 
@@ -358,6 +362,15 @@ detect_patterns = multi_strategy_live.detect_patterns
 score_signals   = multi_strategy_live.score_signals
 log.info("[SCANNER] Multi-strategy active: OB Shorts + ORB + Gap-Fill + Candle-Struct")
 
+# ---- Kronos confirmation gate (reads forecast from Gist; no torch) ----
+try:
+    import kronos_gate
+    _KRONOS_OK = True
+    log.info("[SCANNER] Kronos gate active")
+except Exception as _e:
+    _KRONOS_OK = False
+    log.info(f"[SCANNER] Kronos gate unavailable ({_e})")
+
 # =====================================================================
 # STATE  (all mutated under _POS_LOCK — fix #5)
 # =====================================================================
@@ -404,6 +417,7 @@ def record_suggestion(sig: dict):
             "price":    sig.get("price"),
             "score":    sig.get("score"),
             "vol_ratio": sig.get("vol_ratio"),
+            "kronos":   sig.get("kronos", ""),
             "time":     sig.get("time"),
             "acted":    False,
         })
@@ -1021,8 +1035,9 @@ def build_daily_report() -> str:
     if not_acted:
         L.append(f"\n<b>── Other Suggestions ({len(not_acted)}) ──</b>")
         for s in not_acted[:15]:
+            kro = f" | {s['kronos']}" if s.get("kronos") else ""
             L.append(f"• {s['symbol']} [{s['strategy']}] {s['signal']} "
-                     f"₹{s['price']} | score {s['score']} | {s['time']}")
+                     f"₹{s['price']} | score {s['score']} | {s['time']}{kro}")
 
     best = max((t['pnl'] for t in tot["trades"]), default=0.0)
     worst = min((t['pnl'] for t in tot["trades"]), default=0.0)
@@ -1087,11 +1102,20 @@ def act_on_signals(dhan, ranked):
         sigd = sig.to_dict()
         strat = sigd.get("strategy", "?")
 
+        # ---- Kronos confirmation / score adjust (v5) ----
+        if _KRONOS_OK:
+            allow, adj, kreason = kronos_gate.kronos_check(sigd["symbol"], direction)
+            sigd["kronos"] = kreason
+            if not allow:                      # strict-mode veto
+                log.info(f"[{sigd['symbol']}] Kronos veto: {kreason}")
+                continue
+            sigd["score"] = int(sigd.get("score", 0)) + adj   # soft-mode boost/penalty
+
         # record every surfaced suggestion (for the day's report)
         record_suggestion(sigd)
         tg_send(f"📊 {sigd['symbol']} {sigd['signal']} [{strat}] {sigd['pattern']}\n"
                 f"₹{sigd['price']} | Score {sigd['score']} | Vol×{sigd.get('vol_ratio','?')} | "
-                f"{sigd.get('time','')}", silent=True)
+                f"{sigd.get('kronos','')} | {sigd.get('time','')}", silent=True)
 
         # only trade if score qualifies, in-window, and entry not blocked (v4)
         if sigd["score"] >= MIN_SCORE_TO_TRADE and in_session_for_entries():
