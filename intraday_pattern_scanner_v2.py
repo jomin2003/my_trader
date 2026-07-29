@@ -1,6 +1,6 @@
 """
 =====================================================================
-DHAN INTRADAY SCANNER + AUTO-TRADER + TELEGRAM  (v5 — Kronos-gated)
+DHAN INTRADAY SCANNER + AUTO-TRADER + TELEGRAM  (v6 — Kronos-adaptive exits)
 =====================================================================
 Runs 4 strategies via multi_strategy_live.py:
   - OB SHORTS      - shooting star at bear OB zones (validated)
@@ -17,28 +17,25 @@ TRADE-MANAGEMENT FIXES (v3):
   #12 consistent keys.  #13 paper fills simulated off bar high/low.
 
 PROFIT-CAPTURE EXITS (v3):
-  PEAK_EXIT   - reached profit then faded -> lock the peak
-  TIME_PROFIT - held too long AND in profit -> take what's there
-  TIME_STALE  - held way too long -> cut it regardless
+  PEAK_EXIT / TIME_PROFIT / TIME_STALE for trades that drag.
 
 HUMAN-LIKE DISCIPLINE (v4):
-  * BREAKEVEN stop     - once +0.7R, move SL to entry (+buffer).
-  * DAILY CIRCUIT      - auto-halt on max loss / max trades / consecutive losses.
-  * LOSS COOLDOWN      - after a losing trade in a symbol, block re-entry a while.
-  * UNREALISED P&L     - /report shows floating P&L on open positions.
+  BREAKEVEN stop, DAILY CIRCUIT breakers, LOSS COOLDOWN, UNREALISED P&L.
 
-KRONOS AI GATE (v5 — NEW):
-  * Reads a directional forecast (published to a Gist by a FREE GitHub
-    Actions job running the Kronos model) via kronos_gate.py.
-  * soft mode  -> +boost when Kronos agrees, -penalty when it disagrees.
-  * strict mode-> veto entries that a confident Kronos view opposes.
-  * If the forecast is missing/stale, the gate is a no-op (bot unaffected).
+KRONOS AI GATE (v5):
+  Reads a Gist forecast (published by a free GitHub Actions job) via
+  kronos_gate.py. soft = score +/- boost; strict = veto disagreements.
+
+KRONOS-ADAPTIVE EXITS (v6 — NEW):
+  kronos_exits.adjust_exits() scales the SL distance by Kronos's predicted
+  volatility and caps the target near Kronos's expected move — so exits are
+  FORWARD-looking instead of lagging ATR. Safe no-op when Kronos has no view.
 
 DAILY REPORT (Telegram /report, /pnl, EOD push) with full blotter.
 
 AUTO_TRADE_ENABLED = False (paper trading). Keep False 2 weeks.
 Requires alongside this file: multi_strategy_live.py, structure_levels.py,
-ob_data.csv, gap_data.csv  (kronos_gate.py optional but recommended)
+ob_data.csv, gap_data.csv  (kronos_gate.py + kronos_exits.py optional)
 """
 from __future__ import annotations
 
@@ -371,6 +368,15 @@ except Exception as _e:
     _KRONOS_OK = False
     log.info(f"[SCANNER] Kronos gate unavailable ({_e})")
 
+# ---- Kronos-adaptive SL/target sizing (forward-looking exits) ----
+try:
+    import kronos_exits
+    _KEXIT_OK = True
+    log.info("[SCANNER] Kronos-adaptive exits active")
+except Exception as _e:
+    _KEXIT_OK = False
+    log.info(f"[SCANNER] Kronos-adaptive exits unavailable ({_e})")
+
 # =====================================================================
 # STATE  (all mutated under _POS_LOCK — fix #5)
 # =====================================================================
@@ -443,6 +449,7 @@ def _record_trade(sym, pos, outcome, exit_price, qty, pnl):
         "qty":      int(qty),
         "pnl":      round(pnl, 2),
         "r":        r_multiple,
+        "kexit":    pos.get("kexit", ""),
         "time":     now_ist().strftime("%H:%M:%S"),
     })
 
@@ -642,6 +649,18 @@ def place_bracket_orders(dhan, sig):
         log.info(f"[{symbol}] invalid SL distance — skip")
         return
 
+    # ---- Kronos-adaptive exits (v6): scale SL by forecast vol, cap target near exp_ret ----
+    kexit_note = ""
+    if _KEXIT_OK:
+        try:
+            new_sl_dist, tgt, kexit_note = kronos_exits.adjust_exits(
+                symbol, dirn, entry_px, sl_dist, tgt, rr=RISK_REWARD_RATIO)
+            sl_dist = new_sl_dist
+            sl = round(entry_px - dirn * sl_dist, 2)   # recompute SL price from adjusted distance
+            log.info(f"[{symbol}] {kexit_note} -> SL {sl} TGT {tgt}")
+        except Exception as e:
+            log.debug(f"[{symbol}] kexit skipped: {e}")
+
     qty = compute_quantity(entry_px, sl_dist)
     if qty <= 0:
         log.info(f"[{symbol}] qty=0 (risk/capital caps) — skip")
@@ -654,7 +673,7 @@ def place_bracket_orders(dhan, sig):
         "symbol": symbol, "security_id": sec_id, "side": side,
         "entry": entry_px, "sl": sl, "target": tgt, "qty": qty,
         "init_sl_dist": sl_dist, "atr": atr_store, "strategy": strat,
-        "pattern": sig.get("pattern", ""),
+        "pattern": sig.get("pattern", ""), "kexit": kexit_note,
         "sl_id": None, "tgt_id": None,
         "opened_at": now_ist(), "partial_done": False, "be_done": False,
         "best_fav": 0.0, "best_price": entry_px, "last_price": entry_px,
@@ -753,7 +772,6 @@ def _update_breakeven(dhan, sym, pos, price):
         return
     buffer = BREAKEVEN_BUFFER_R * init_sl_dist
     new_sl = round(entry + direction * buffer, 2)
-    # only if it tightens the stop favorably
     if direction > 0 and new_sl <= pos["sl"]:
         pos["be_done"] = True; return
     if direction < 0 and new_sl >= pos["sl"]:
