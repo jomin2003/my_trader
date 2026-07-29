@@ -7,3 +7,4 @@ tzdata>=2024.1
 dhanhq>=2.0.0
 yfinance>=0.2.40
 pyotp>=2.9.0
+pandas-ta>=0.3.14b0
