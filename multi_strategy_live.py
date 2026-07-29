@@ -18,6 +18,11 @@ STRATEGIES:
   C) GAP-FILL       - fade 1-3% gap on low volume, 09:30-11:30
   D) CANDLE-STRUCT  - candlestick reversal + structure-based SL/target
                       (engulfing/hammer/star), VWAP-aligned, 09:30-14:30
+
+TIER-1 (NEW): indicators_ta confluence boost. Every signal's `score` is
+nudged by how many extra indicators (RSI/Supertrend/EMA/CMF/MACD) agree
+with its direction, and the agreeing tags are stored in `ta`. Safe no-op
+if indicators_ta / pandas-ta is unavailable.
 """
 from __future__ import annotations
 
@@ -41,6 +46,16 @@ try:
 except Exception as _e:
     _STRUCT_OK = False
     log.warning(f"structure_levels not available ({_e}) — Candle-Struct disabled")
+
+# ---- Tier-1: indicators_ta confluence boost (safe no-op if missing) ----
+try:
+    import indicators_ta
+    _ITA_OK = True
+    log.info("[MULTI] indicators_ta confluence boost active")
+except Exception as _e:
+    _ITA_OK = False
+    log.info(f"[MULTI] indicators_ta unavailable ({_e}) — confluence boost off")
+_CUR_DF = None   # set per-call so _row() can score confluence on this symbol's bars
 
 # ---------- shared scanner config ----------
 scn.MIN_CANDLES_NEEDED   = 4
@@ -246,6 +261,10 @@ def detect_patterns(df):
 def score_signals(symbol, security_id, df, hits):
     if not hits: return []
 
+    # Tier-1: make this symbol's bars available to _row() for confluence
+    global _CUR_DF
+    _CUR_DF = df
+
     # ADX momentum filter — reject choppy stocks
     if ADX_FILTER_ENABLED and len(df) >= 28:
         adx_val = scn.adx(df, 14)
@@ -353,13 +372,20 @@ def score_signals(symbol, security_id, df, hits):
 
 
 def _row(sym, sid, pattern, side, direction, score, vr, px, hi, lo, atr, vwap, t, strat):
+    # ---- Tier-1 confluence boost from indicators_ta (safe no-op if unavailable) ----
+    ta_boost, ta_tags = 0, ""
+    if _ITA_OK and _CUR_DF is not None:
+        try:
+            ta_boost, ta_tags = indicators_ta.confluence_score(_CUR_DF, direction)
+        except Exception:
+            ta_boost, ta_tags = 0, ""
     return {
         "symbol": sym, "security_id": sid, "pattern": pattern,
         "signal": side, "direction": direction, "strength": score,
-        "vol_ratio": round(vr, 2), "score": score, "price": round(px, 2),
+        "vol_ratio": round(vr, 2), "score": score + ta_boost, "price": round(px, 2),
         "pattern_high": round(hi, 2), "pattern_low": round(lo, 2),
         "atr": round(atr, 2), "vwap": round(vwap, 2) if vwap else None,
-        "strategy": strat, "time": t,
+        "strategy": strat, "ta": ta_tags, "time": t,
     }
 
 
