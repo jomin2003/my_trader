@@ -2,15 +2,16 @@
 FLASK WEB SERVICE for Render FREE TIER + external cron + TELEGRAM COMMANDS
 =========================================================================
 CHANGES vs previous:
-  - NEW: /trigger/learn endpoint (EOD cron ~15:45 IST) -> appends the day's
-         trades to the Gist strategy ledger + runs the adaptive allocator
-         (shadow or active) + Telegram summary.  (self-improving loop)
+  - NEW: crash/cold-start-safe STATE PERSISTENCE via state_store.py.
+         boot_restore() restores today's open positions / halts / kill
+         switch from the Gist; _scan_worker + _oco_worker snapshot state
+         (throttled) so a Render cold start can't silently wipe safety.
+  - /trigger/learn endpoint (EOD cron ~15:45 IST) -> ledger + allocator.
   - /report + /pnl Telegram commands -> live day's-PnL report.
   - /trigger/report endpoint (cron 15:40 IST) -> pushes the day's report.
-  - /status shows Kronos forecast summary + allocator line.
+  - /status shows Kronos summary + allocator line + last learn.
   - /resume clears the scanner's AUTO-halt (circuit breaker).
-  - Day-boundary calls scn.reset_day() (clears signals/trades/positions/halts).
-  - Background-thread scans, universe cached per day, overlap guard.
+  - Day-boundary calls scn.reset_day().
 
 Telegram commands:
   /status  -> live status (scans, token, market, open pos, halt, Kronos, allocator)
@@ -32,7 +33,7 @@ Endpoints:
   POST /trigger/download    - append bars + refresh OB data
   POST /trigger/promote     - promote latest sweep
   POST /trigger/report      - push today's P&L report to Telegram
-  POST /trigger/learn       - append trades to ledger + run allocator   (NEW)
+  POST /trigger/learn       - append trades to ledger + run allocator
 """
 from __future__ import annotations
 
@@ -173,6 +174,19 @@ def boot_restore():
     except Exception as e:
         log.error(f"Token refresh on boot failed: {e}")
         _record_error(f"boot token: {e}")
+    # ---- crash/cold-start recovery: restore today's live state ----
+    try:
+        import intraday_pattern_scanner_v2 as scn
+        import state_store
+        info = state_store.restore_state(scn, STATE)
+        if info.get("restored"):
+            log.info(f"State restored: {info}")
+            tg_send(f"♻️ State restored: {info['positions']} open position(s), "
+                    f"halted={info.get('halted')}", silent=True)
+        else:
+            log.info(f"State restore skipped ({info.get('reason')})")
+    except Exception as e:
+        log.warning(f"state restore skipped: {e}")
     tg_send(f"🟢 App booted on Render at {now_ist():%H:%M IST}", silent=True)
 
 _DHAN = None
@@ -192,6 +206,14 @@ def reset_dhan():
     global _DHAN
     with _DHAN_LOCK:
         _DHAN = None
+
+def _snapshot_state(scn):
+    "Throttled state snapshot to Gist (safe no-op if state_store unavailable)."
+    try:
+        import state_store
+        state_store.save_state(scn, STATE)
+    except Exception:
+        pass
 
 def _get_universe(scn):
     global _UNIVERSE, _UNIVERSE_DATE
@@ -273,6 +295,7 @@ def _scan_worker():
             log.debug(f"OCO issue: {e}")
         STATE["last_scan_result"] = f"ok, {signals_count} signals"
         log.info(f"Scan complete: {signals_count} signals")
+        _snapshot_state(scn)   # persist state after each scan (throttled)
     except Exception as e:
         _record_error(f"scan: {e}")
         STATE["last_scan_result"] = f"error: {str(e)[:100]}"
@@ -288,6 +311,7 @@ def _oco_worker():
             return
         import intraday_pattern_scanner_v2 as scn
         scn.monitor_oco(get_dhan())
+        _snapshot_state(scn)   # persist state after OCO management (throttled)
     except Exception as e:
         _record_error(f"oco: {e}")
 
@@ -308,13 +332,11 @@ def _learn_worker():
         import intraday_pattern_scanner_v2 as scn
         import strategy_ledger
         import adaptive_allocator
-        # snapshot today's completed trades under the position lock
         try:
             with scn._POS_LOCK:
                 trades = list(scn._COMPLETED_TRADES)
         except Exception:
             trades = list(getattr(scn, "_COMPLETED_TRADES", []))
-        # best-effort NIFTY trend tag for regime context
         ntrend = 0
         try:
             ntrend = scn.get_nifty_trend(get_dhan())
@@ -368,13 +390,11 @@ def _build_status_text() -> str:
         f"Last report: {STATE['last_report']}",
         f"Last learn: {STATE['last_learn']}",
     ]
-    # Kronos forecast summary (no-op if gate/forecast unavailable)
     try:
         import kronos_gate
         lines.append(kronos_gate.kronos_summary())
     except Exception:
         pass
-    # Adaptive allocator one-liner (no-op if unavailable)
     try:
         import adaptive_allocator
         lines.append(adaptive_allocator.summary_text(str(BASE_DIR)).split("\n")[0])
@@ -414,12 +434,21 @@ def telegram_webhook():
                 tg_send_to(chat_id, f"⚠️ Report error: {str(e)[:200]}")
         elif cmd == "stop":
             STATE["trading_halted"] = True
+            # persist the kill switch immediately so a cold start keeps it
+            try:
+                import intraday_pattern_scanner_v2 as scn
+                import state_store
+                state_store.save_state(scn, STATE, force=True)
+            except Exception:
+                pass
             tg_send_to(chat_id, "🛑 Trading HALTED. Scans continue; no new orders.")
         elif cmd == "resume":
             STATE["trading_halted"] = False
             try:
                 import intraday_pattern_scanner_v2 as scn
                 scn.resume_trading()   # also clears the circuit-breaker auto-halt
+                import state_store
+                state_store.save_state(scn, STATE, force=True)
             except Exception:
                 pass
             tg_send_to(chat_id, "▶️ Trading RESUMED (manual + auto halt cleared).")
