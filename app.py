@@ -2,17 +2,18 @@
 FLASK WEB SERVICE for Render FREE TIER + external cron + TELEGRAM COMMANDS
 =========================================================================
 CHANGES vs previous:
-  - NEW: /report + /pnl Telegram commands -> live day's-PnL report.
-  - NEW: POST /trigger/report endpoint (cron at 15:40 IST) -> pushes the
-         day's report to Telegram.
-  - NEW: /status shows the Kronos forecast summary (kronos_gate).
-  - /resume now also clears the scanner's AUTO-halt (circuit breaker).
+  - NEW: /trigger/learn endpoint (EOD cron ~15:45 IST) -> appends the day's
+         trades to the Gist strategy ledger + runs the adaptive allocator
+         (shadow or active) + Telegram summary.  (self-improving loop)
+  - /report + /pnl Telegram commands -> live day's-PnL report.
+  - /trigger/report endpoint (cron 15:40 IST) -> pushes the day's report.
+  - /status shows Kronos forecast summary + allocator line.
+  - /resume clears the scanner's AUTO-halt (circuit breaker).
   - Day-boundary calls scn.reset_day() (clears signals/trades/positions/halts).
-  - Background-thread scans (no cron timeout), universe cached per day,
-    overlap guard on scans.
+  - Background-thread scans, universe cached per day, overlap guard.
 
-Telegram commands (type in your bot chat):
-  /status  -> full live status (scans, token, market, open pos, halt, Kronos)
+Telegram commands:
+  /status  -> live status (scans, token, market, open pos, halt, Kronos, allocator)
   /report  -> today's trades + suggestions + realised + floating P&L
   /pnl     -> alias of /report
   /health  -> quick alive check
@@ -31,6 +32,7 @@ Endpoints:
   POST /trigger/download    - append bars + refresh OB data
   POST /trigger/promote     - promote latest sweep
   POST /trigger/report      - push today's P&L report to Telegram
+  POST /trigger/learn       - append trades to ledger + run allocator   (NEW)
 """
 from __future__ import annotations
 
@@ -87,6 +89,7 @@ STATE = {
     "last_download":      None,
     "last_token_refresh": None,
     "last_report":        None,
+    "last_learn":         None,
     "scans_today":        0,
     "signals_today":      0,
     "orders_today":       0,
@@ -299,6 +302,33 @@ def _report_worker():
         _record_error(f"report: {e}")
         tg_send(f"⚠️ Report failed: {str(e)[:200]}")
 
+def _learn_worker():
+    "EOD: append today's trades to the Gist ledger + run the allocator."
+    try:
+        import intraday_pattern_scanner_v2 as scn
+        import strategy_ledger
+        import adaptive_allocator
+        # snapshot today's completed trades under the position lock
+        try:
+            with scn._POS_LOCK:
+                trades = list(scn._COMPLETED_TRADES)
+        except Exception:
+            trades = list(getattr(scn, "_COMPLETED_TRADES", []))
+        # best-effort NIFTY trend tag for regime context
+        ntrend = 0
+        try:
+            ntrend = scn.get_nifty_trend(get_dhan())
+        except Exception:
+            pass
+        strategy_ledger.append_today(trades, nifty_trend=ntrend, base_dir=str(BASE_DIR))
+        adaptive_allocator.run(base_dir=str(BASE_DIR))
+        tg_send(adaptive_allocator.summary_text(base_dir=str(BASE_DIR)))
+        STATE["last_learn"] = now_ist().isoformat()
+        log.info(f"Learn step done: {len(trades)} trades ledgered")
+    except Exception as e:
+        _record_error(f"learn: {e}")
+        tg_send(f"⚠️ Learn step failed: {str(e)[:200]}")
+
 # =====================================================================
 # TELEGRAM COMMAND HANDLER
 # =====================================================================
@@ -336,11 +366,18 @@ def _build_status_text() -> str:
         f"Token hours left: {token_hours_left}",
         f"Last scan: {STATE['last_scan']}",
         f"Last report: {STATE['last_report']}",
+        f"Last learn: {STATE['last_learn']}",
     ]
     # Kronos forecast summary (no-op if gate/forecast unavailable)
     try:
         import kronos_gate
         lines.append(kronos_gate.kronos_summary())
+    except Exception:
+        pass
+    # Adaptive allocator one-liner (no-op if unavailable)
+    try:
+        import adaptive_allocator
+        lines.append(adaptive_allocator.summary_text(str(BASE_DIR)).split("\n")[0])
     except Exception:
         pass
     if STATE["errors_last_10"]:
@@ -389,7 +426,7 @@ def telegram_webhook():
         elif cmd == "help":
             tg_send_to(chat_id,
                 "Commands:\n"
-                "/status — live status + halt + Kronos\n"
+                "/status — live status + halt + Kronos + allocator\n"
                 "/report — today's P&L + trades + suggestions\n"
                 "/pnl — same as /report\n"
                 "/stop — halt order placement\n"
@@ -443,6 +480,12 @@ def status():
         kronos_info = kronos_gate.kronos_summary()
     except Exception:
         pass
+    alloc_mode = None
+    try:
+        import adaptive_allocator
+        alloc_mode = adaptive_allocator.ALLOC_MODE
+    except Exception:
+        pass
     return jsonify({
         "time_ist":           now_ist().isoformat(),
         "in_market_hours":    MARKET_OPEN <= now_ist().time() <= MARKET_CLOSE,
@@ -455,6 +498,7 @@ def status():
         "auto_halt":          auto_halt,
         "auto_halt_reason":   halt_reason,
         "kronos":             kronos_info,
+        "allocator_mode":     alloc_mode,
         "state":              STATE,
     })
 
@@ -499,6 +543,13 @@ def trigger_report():
     "Push today's P&L report to Telegram (cron at ~15:40 IST)."
     threading.Thread(target=_report_worker, daemon=True).start()
     return jsonify({"ok": True, "note": "report started in background"})
+
+@app.route("/trigger/learn", methods=["POST", "GET"])
+@require_cron_secret
+def trigger_learn():
+    "EOD (cron ~15:45 IST): ledger today's trades + run adaptive allocator."
+    threading.Thread(target=_learn_worker, daemon=True).start()
+    return jsonify({"ok": True, "note": "learn started in background"})
 
 @app.route("/trigger/download", methods=["POST", "GET"])
 @require_cron_secret
@@ -546,4 +597,3 @@ boot_restore()
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port, debug=False)
-
