@@ -377,7 +377,7 @@ except Exception as _e:
     _KEXIT_OK = False
     log.info(f"[SCANNER] Kronos-adaptive exits unavailable ({_e})")
 
-# ---- Per-strategy exit tuning (safe no-op fallback to globals) ----
+# ---- Tier-1: per-strategy exit tuning (safe no-op fallback to globals) ----
 try:
     import strategy_exits
     _SEXIT_OK = True
@@ -386,7 +386,7 @@ except Exception as _e:
     _SEXIT_OK = False
     log.info(f"[SCANNER] Per-strategy exits unavailable ({_e})")
 
-# ---- Tier-2 LightGBM volatility gate (OFF by default; neutral unless enabled) ----
+# ---- Tier-2: LightGBM volatility gate (OFF by default; neutral unless enabled) ----
 # Keep OFF if kronos_exits is already scaling SL by predicted vol (avoid double-count).
 try:
     import vol_gate
@@ -395,6 +395,17 @@ try:
 except Exception as _e:
     _VOLGATE_OK = False
     log.info(f"[SCANNER] Vol gate unavailable ({_e})")
+
+# ---- Tier-3: learned SL/TGT (RR) predictor (OFF by default; neutral unless enabled) ----
+# Trained on YOUR history. When it returns a pick, it SUPERSEDES Kronos for that
+# trade (see place_bracket_orders) so the two never double-count.
+try:
+    import rr_predictor
+    _RRGATE_OK = True
+    log.info("[SCANNER] RR predictor loaded")
+except Exception as _e:
+    _RRGATE_OK = False
+    log.info(f"[SCANNER] RR predictor unavailable ({_e})")
 
 # =====================================================================
 # STATE  (all mutated under _POS_LOCK — fix #5)
@@ -552,17 +563,27 @@ def _entry_blocked(symbol) -> str | None:
 # =====================================================================
 # ORDER PLUMBING
 # =====================================================================
-def compute_sl_target(entry, direction, atr_val, strategy=None, symbol=None):
-    # per-strategy multipliers; falls back to globals if unavailable/unknown
+def compute_sl_target(entry, direction, atr_val, strategy=None, symbol=None,
+                      rr_override=None):
+    # Tier-1: per-strategy multipliers; falls back to globals if unknown
     if _SEXIT_OK:
         sl_mult, rr, _tm = strategy_exits.get_exit_params(
             strategy, ATR_MULTIPLIER, RISK_REWARD_RATIO, TRAILING_ATR_MULT)
     else:
         sl_mult, rr = ATR_MULTIPLIER, RISK_REWARD_RATIO
-    # Tier-2 forward-looking vol scale (neutral 1.0 unless gate enabled+skilled)
+    # Tier-2: forward-looking vol scale (neutral 1.0 unless gate enabled+skilled)
     if _VOLGATE_OK and symbol:
         try:
             sl_mult *= vol_gate.vol_scale(symbol)
+        except Exception:
+            pass
+    # Tier-3: learned RR override (highest priority; SL & TGT both in ATR units)
+    if rr_override:
+        try:
+            o_sl, o_tgt = float(rr_override[0]), float(rr_override[1])
+            if o_sl > 0 and o_tgt > 0:
+                sl_mult = o_sl          # supersedes Tier-1/Tier-2 sizing
+                rr = o_tgt / o_sl
         except Exception:
             pass
     if USE_ATR_STOP and atr_val and atr_val > 0:
@@ -671,18 +692,38 @@ def place_bracket_orders(dhan, sig):
     # ---- structural exits if the signal carries them, else ATR ----
     struct_sl  = sig.get("struct_sl")
     struct_tgt = sig.get("struct_target")
+    rr_override = None
     if struct_sl and struct_tgt:
         sl = float(struct_sl); tgt = float(struct_tgt); sl_dist = abs(entry_px - sl)
     else:
-        sl, tgt, sl_dist = compute_sl_target(entry_px, dirn, atr_val, strat, symbol)
+        # ---- Tier-3: learned best SL/TGT (OFF by default; None -> normal logic) ----
+        # Only fetches bars + predicts when the RR gate is enabled AND skilled,
+        # so when OFF there is ZERO extra work and behaviour is unchanged.
+        if _RRGATE_OK:
+            try:
+                if rr_predictor.enabled():
+                    _rrdf = fetch_intraday(dhan, sec_id)
+                    _feat = rr_predictor.features_from_ohlc(_rrdf)
+                    if _feat is not None:
+                        _rec = rr_predictor.best_rr(_feat, dirn)
+                        if _rec:
+                            rr_override = (_rec["sl_mult"], _rec["tgt_mult"])
+                            log.info(f"[{symbol}] RR model: SL×{_rec['sl_mult']} "
+                                     f"TGT×{_rec['tgt_mult']} predR={_rec['pred_r']}")
+            except Exception as _e:
+                log.debug(f"[{symbol}] RR predict skipped: {_e}")
+        sl, tgt, sl_dist = compute_sl_target(entry_px, dirn, atr_val,
+                                             strat, symbol, rr_override)
 
     if sl_dist <= 0:
         log.info(f"[{symbol}] invalid SL distance — skip")
         return
 
     # ---- Kronos-adaptive exits (v6): scale SL by forecast vol, cap target near exp_ret ----
+    # GUARD: if the Tier-3 RR model already set the levels (rr_override), SKIP
+    # Kronos so the two never double-count. Kronos only runs when RR had no view.
     kexit_note = ""
-    if _KEXIT_OK:
+    if _KEXIT_OK and rr_override is None:
         try:
             new_sl_dist, tgt, kexit_note = kronos_exits.adjust_exits(
                 symbol, dirn, entry_px, sl_dist, tgt, rr=RISK_REWARD_RATIO)
@@ -691,6 +732,8 @@ def place_bracket_orders(dhan, sig):
             log.info(f"[{symbol}] {kexit_note} -> SL {sl} TGT {tgt}")
         except Exception as e:
             log.debug(f"[{symbol}] kexit skipped: {e}")
+    elif rr_override is not None:
+        kexit_note = "RR-model (Kronos skipped)"
 
     qty = compute_quantity(entry_px, sl_dist)
     if qty <= 0:

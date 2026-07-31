@@ -1,0 +1,81 @@
+{
+  "model": "lightgbm",
+  "rows": 5307552,
+  "best_iter": 127,
+  "val_mse": 1.128838,
+  "skill_vs_mean": 0.0631,
+  "feature_importance": {
+    "atr_frac": 1351,
+    "vwap_dist": 1345,
+    "adx": 794,
+    "sl_mult": 744,
+    "tod": 694,
+    "rsi": 637,
+    "ema_dist": 430,
+    "vol_ratio": 402,
+    "range_pct": 364,
+    "ret3": 274,
+    "tgt_mult": 245,
+    "ret1": 208,
+    "gap_pct": 205,
+    "body_frac": 181
+  },
+  "features": [
+    "atr_frac",
+    "rsi",
+    "vwap_dist",
+    "ema_dist",
+    "adx",
+    "vol_ratio",
+    "ret1",
+    "ret3",
+    "range_pct",
+    "gap_pct",
+    "tod",
+    "body_frac",
+    "sl_mult",
+    "tgt_mult"
+  ],
+  "sl_grid": [
+    1.0,
+    1.25,
+    1.5,
+    1.75,
+    2.0,
+    2.5
+  ],
+  "tgt_grid": [
+    1.5,
+    2.0,
+    2.5,
+    3.0,
+    3.5,
+    4.0
+  ],
+  "cost_model": {
+    "slippage_bps": 3,
+    "taxes_bps_oneway": 6
+  },
+  "dataset": {
+    "symbols": 4,
+    "entries": 73716,
+    "grid_rows": 5307552,
+    "grid_size": 36,
+    "outcomes": {
+      "SL": 2132450,
+      "TGT": 1065351,
+      "TIME": 2109751
+    }
+  },
+  "horizon_bars": 12,
+  "side_mode": "both",
+  "recommend_distribution": {
+    "SL2.5/TGT4.0": 262,
+    "SL2.5/TGT3.5": 111,
+    "SL2.5/TGT2.5": 62,
+    "SL2.5/TGT1.5": 46,
+    "SL2.5/TGT3.0": 14,
+    "SL2.5/TGT2.0": 5
+  },
+  "generated_utc": "2026-07-31T18:46:59.941921+00:00"
+}
