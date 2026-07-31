@@ -386,6 +386,16 @@ except Exception as _e:
     _SEXIT_OK = False
     log.info(f"[SCANNER] Per-strategy exits unavailable ({_e})")
 
+# ---- Tier-2 LightGBM volatility gate (OFF by default; neutral unless enabled) ----
+# Keep OFF if kronos_exits is already scaling SL by predicted vol (avoid double-count).
+try:
+    import vol_gate
+    _VOLGATE_OK = True
+    log.info("[SCANNER] Vol gate loaded")
+except Exception as _e:
+    _VOLGATE_OK = False
+    log.info(f"[SCANNER] Vol gate unavailable ({_e})")
+
 # =====================================================================
 # STATE  (all mutated under _POS_LOCK — fix #5)
 # =====================================================================
@@ -542,13 +552,19 @@ def _entry_blocked(symbol) -> str | None:
 # =====================================================================
 # ORDER PLUMBING
 # =====================================================================
-def compute_sl_target(entry, direction, atr_val, strategy=None):
+def compute_sl_target(entry, direction, atr_val, strategy=None, symbol=None):
     # per-strategy multipliers; falls back to globals if unavailable/unknown
     if _SEXIT_OK:
         sl_mult, rr, _tm = strategy_exits.get_exit_params(
             strategy, ATR_MULTIPLIER, RISK_REWARD_RATIO, TRAILING_ATR_MULT)
     else:
         sl_mult, rr = ATR_MULTIPLIER, RISK_REWARD_RATIO
+    # Tier-2 forward-looking vol scale (neutral 1.0 unless gate enabled+skilled)
+    if _VOLGATE_OK and symbol:
+        try:
+            sl_mult *= vol_gate.vol_scale(symbol)
+        except Exception:
+            pass
     if USE_ATR_STOP and atr_val and atr_val > 0:
         sl_dist = sl_mult * atr_val
     else:
@@ -658,7 +674,7 @@ def place_bracket_orders(dhan, sig):
     if struct_sl and struct_tgt:
         sl = float(struct_sl); tgt = float(struct_tgt); sl_dist = abs(entry_px - sl)
     else:
-        sl, tgt, sl_dist = compute_sl_target(entry_px, dirn, atr_val, strat)
+        sl, tgt, sl_dist = compute_sl_target(entry_px, dirn, atr_val, strat, symbol)
 
     if sl_dist <= 0:
         log.info(f"[{symbol}] invalid SL distance — skip")
