@@ -377,6 +377,15 @@ except Exception as _e:
     _KEXIT_OK = False
     log.info(f"[SCANNER] Kronos-adaptive exits unavailable ({_e})")
 
+# ---- Per-strategy exit tuning (safe no-op fallback to globals) ----
+try:
+    import strategy_exits
+    _SEXIT_OK = True
+    log.info("[SCANNER] Per-strategy exits active")
+except Exception as _e:
+    _SEXIT_OK = False
+    log.info(f"[SCANNER] Per-strategy exits unavailable ({_e})")
+
 # =====================================================================
 # STATE  (all mutated under _POS_LOCK — fix #5)
 # =====================================================================
@@ -533,16 +542,22 @@ def _entry_blocked(symbol) -> str | None:
 # =====================================================================
 # ORDER PLUMBING
 # =====================================================================
-def compute_sl_target(entry, direction, atr_val):
+def compute_sl_target(entry, direction, atr_val, strategy=None):
+    # per-strategy multipliers; falls back to globals if unavailable/unknown
+    if _SEXIT_OK:
+        sl_mult, rr, _tm = strategy_exits.get_exit_params(
+            strategy, ATR_MULTIPLIER, RISK_REWARD_RATIO, TRAILING_ATR_MULT)
+    else:
+        sl_mult, rr = ATR_MULTIPLIER, RISK_REWARD_RATIO
     if USE_ATR_STOP and atr_val and atr_val > 0:
-        sl_dist = ATR_MULTIPLIER * atr_val
+        sl_dist = sl_mult * atr_val
     else:
         sl_dist = FALLBACK_SL_PERCENT * entry
     sl_dist = max(MIN_SL_PCT * entry, min(sl_dist, MAX_SL_PCT * entry))
     if direction > 0:
-        sl = round(entry - sl_dist, 2); tgt = round(entry + RISK_REWARD_RATIO * sl_dist, 2)
+        sl = round(entry - sl_dist, 2); tgt = round(entry + rr * sl_dist, 2)
     else:
-        sl = round(entry + sl_dist, 2); tgt = round(entry - RISK_REWARD_RATIO * sl_dist, 2)
+        sl = round(entry + sl_dist, 2); tgt = round(entry - rr * sl_dist, 2)
     return sl, tgt, sl_dist
 
 def compute_quantity(entry, sl_dist):
@@ -643,7 +658,7 @@ def place_bracket_orders(dhan, sig):
     if struct_sl and struct_tgt:
         sl = float(struct_sl); tgt = float(struct_tgt); sl_dist = abs(entry_px - sl)
     else:
-        sl, tgt, sl_dist = compute_sl_target(entry_px, dirn, atr_val)
+        sl, tgt, sl_dist = compute_sl_target(entry_px, dirn, atr_val, strat)
 
     if sl_dist <= 0:
         log.info(f"[{symbol}] invalid SL distance — skip")
@@ -822,7 +837,9 @@ def _update_trailing_stop(dhan, sym, pos, current_price):
     profit = (current_price - entry) * direction
     if profit < TRAIL_ACTIVATE_R * init_sl_dist:
         return
-    atr_trail = (pos.get("atr") or init_sl_dist) * TRAILING_ATR_MULT  # fix #7
+    _tm = (strategy_exits.trail_mult_for(pos.get("strategy"), TRAILING_ATR_MULT)
+           if _SEXIT_OK else TRAILING_ATR_MULT)
+    atr_trail = (pos.get("atr") or init_sl_dist) * _tm  # fix #7 (per-strategy)
     if direction > 0:
         new_sl = round(current_price - atr_trail, 2)
         if new_sl <= pos["sl"]:
