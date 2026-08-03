@@ -1,24 +1,28 @@
 {
   "model": "lightgbm",
-  "rows": 88128000,
-  "best_iter": 152,
-  "val_mse": 1.182911,
-  "skill_vs_mean": 0.0563,
+  "objective": "binary_winprob",
+  "target": "triple_barrier_target_first",
+  "time_is_loss": true,
+  "skill_vs_mean": 0.4483,
+  "auc": 0.7242,
+  "base_rate": 0.2109,
+  "rows": 58176000,
+  "best_iter": 792,
   "feature_importance": {
-    "tod": 4677,
-    "ema_dist": 4600,
-    "vwap_dist": 4388,
-    "vol_ratio": 4363,
-    "atr_frac": 3406,
-    "rsi": 3128,
-    "range_pct": 2783,
-    "sl_mult": 2548,
-    "adx": 2384,
-    "ret3": 1731,
-    "ret1": 1471,
-    "body_frac": 1251,
-    "gap_pct": 1106,
-    "tgt_mult": 772
+    "tod": 6230,
+    "atr_frac": 5085,
+    "vol_ratio": 4589,
+    "vwap_dist": 4175,
+    "rsi": 4046,
+    "range_pct": 4033,
+    "adx": 3582,
+    "ret3": 3165,
+    "body_frac": 2993,
+    "ema_dist": 2830,
+    "gap_pct": 2640,
+    "ret1": 2554,
+    "tgt_mult": 2132,
+    "sl_mult": 1050
   },
   "features": [
     "atr_frac",
@@ -56,36 +60,32 @@
     "slippage_bps": 3,
     "taxes_bps_oneway": 6
   },
-  "lgb_params": {
-    "max_bin": 255,
-    "num_leaves": 255
-  },
-  "dataset": {
-    "symbols": 204,
-    "grid_rows": 88128000,
-    "val_rows": 13219200,
-    "grid_size": 36,
-    "outcomes": {
-      "SL": 36000815,
-      "TGT": 18612787,
-      "TIME": 33514398
-    },
-    "stride": 3,
-    "max_entries_per_symbol": 6000
-  },
   "horizon_bars": 12,
   "side_mode": "both",
-  "recommend_distribution": {
-    "SL2.5/TGT4.0": 217,
-    "SL2.5/TGT3.5": 105,
-    "SL2.5/TGT3.0": 46,
-    "SL2.5/TGT2.0": 11,
-    "SL2.5/TGT2.5": 11,
-    "SL1.0/TGT4.0": 5,
-    "SL1.25/TGT4.0": 2,
-    "SL1.25/TGT3.5": 1,
-    "SL1.0/TGT3.5": 1,
-    "SL2.5/TGT1.5": 1
+  "dataset": {
+    "symbols": 202,
+    "stride": 3,
+    "max_entries_per_symbol": 4000
   },
-  "generated_utc": "2026-08-01T16:30:24.538147+00:00"
+  "recommend_distribution": {
+    "SL2.0/TGT1.5": 2925,
+    "SL2.5/TGT2.0": 474,
+    "SL1.5/TGT1.5": 153,
+    "SL2.5/TGT2.5": 130,
+    "SL1.0/TGT1.5": 107,
+    "SL1.75/TGT1.5": 93,
+    "SL1.25/TGT1.5": 64,
+    "SL2.5/TGT3.0": 17,
+    "SL1.0/TGT4.0": 13,
+    "SL1.0/TGT3.5": 6,
+    "SL1.0/TGT3.0": 4,
+    "SL2.5/TGT3.5": 3,
+    "SL2.5/TGT4.0": 3,
+    "SL1.5/TGT4.0": 2,
+    "SL1.0/TGT2.5": 2,
+    "SL2.0/TGT2.0": 2,
+    "SL1.75/TGT3.5": 1,
+    "SL2.0/TGT2.5": 1
+  },
+  "generated_utc": "2026-08-03T20:16:42.054162+00:00"
 }
