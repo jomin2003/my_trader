@@ -98,6 +98,14 @@ def _load_one(path: str) -> Optional[pd.DataFrame]:
                 "open": "first", "high": "max", "low": "min",
                 "close": "last", "volume": "sum",
             }).dropna(how="any")
+        # REAL calendar weekday (0=Mon..4=Fri). The old code used row-index%5,
+        # which silently desyncs on every market holiday -> a noise feature.
+        try:
+            out["dow"] = out.index.dayofweek.astype(float)
+        except Exception:
+            out["dow"] = 0.0
+    else:
+        out["dow"] = 0.0   # no timestamps available -> neutral constant
     out = out.reset_index(drop=True)
     return out if len(out) >= MIN_ROWS_PER_SYMBOL else None
 
@@ -146,7 +154,9 @@ def _make_features(df: pd.DataFrame) -> pd.DataFrame:
     vol_mean = d["volume"].rolling(20).mean()
     vol_std = d["volume"].rolling(20).std().replace(0, np.nan)
     d["vol_z"] = ((d["volume"] - vol_mean) / vol_std).fillna(0.0)
-    d["dow"] = (np.arange(len(d)) % 5).astype(float)  # proxy weekday cycle
+    # REAL weekday from _load_one if available; else neutral constant.
+    if "dow" not in d.columns:
+        d["dow"] = 0.0
 
     # TARGET: next-day Parkinson vol (what we want to forecast)
     d["y_next_vol"] = d["park_vol"].shift(-1)
