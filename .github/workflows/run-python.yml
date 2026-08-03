@@ -30,4 +30,4 @@ jobs:
 
       - name: Run Python script
         run: |
-          python my_trader/rr_doctor.py
+          python ./rr_doctor.py
