@@ -37,6 +37,7 @@ Endpoints:
 """
 from __future__ import annotations
 
+import gc
 import io
 import json
 import logging
@@ -303,6 +304,7 @@ def _scan_worker():
     finally:
         STATE["scan_running"] = False
         _SCAN_LOCK.release()
+        gc.collect()   # release per-scan pandas/numpy arenas on the 512 MB tier
 
 def _oco_worker():
     try:
@@ -599,6 +601,8 @@ def trigger_download():
         except Exception as e:
             _record_error(f"download: {e}")
             tg_send(f"⚠️ Download crashed: {e}")
+        finally:
+            gc.collect()
     threading.Thread(target=_dl, daemon=True).start()
     return jsonify({"ok": True, "note": "download started in background"})
 
@@ -626,3 +630,4 @@ boot_restore()
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port, debug=False)
+

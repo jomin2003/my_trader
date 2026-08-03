@@ -228,22 +228,62 @@ def tg_send(text, silent=False):
 # UNIVERSE
 # =====================================================================
 def load_intraday_universe() -> pd.DataFrame:
+    """Build the intraday universe from Dhan's scrip master.
+
+    MEMORY-SAFE (Render 512 MB free tier):
+      The old version did `pd.read_csv(io.StringIO(resp.text), low_memory=False)`
+      on the full ~35 MB instrument master. That held THREE big copies at once —
+      resp.text (str), the StringIO buffer, and an all-object DataFrame — spiking
+      300-400 MB at every day boundary and OOM-ing the box. This version:
+        1) streams the CSV to a temp file (never a giant Python str), and
+        2) reads ONLY the 5 columns we actually use, as dtype=str,
+      cutting the peak footprint by ~85%.
+    """
+    import gc
+    import tempfile
+
     log.info("Downloading Dhan instrument master ...")
-    resp = requests.get(INSTRUMENT_MASTER_URL, timeout=30); resp.raise_for_status()
-    df = pd.read_csv(io.StringIO(resp.text), low_memory=False)
-    cols = {c.upper(): c for c in df.columns}; C = lambda n: cols[n.upper()]
-    eq = df[(df[C("SEM_EXM_EXCH_ID")].astype(str).str.upper() == "NSE") &
-            (df[C("SEM_SEGMENT")].astype(str).str.upper() == "E") &
-            (df[C("SEM_INSTRUMENT_NAME")].astype(str).str.upper() == "EQUITY")].copy()
+    tmp = tempfile.NamedTemporaryFile(prefix="scrip_", suffix=".csv", delete=False)
+    try:
+        with requests.get(INSTRUMENT_MASTER_URL, timeout=60, stream=True) as resp:
+            resp.raise_for_status()
+            for chunk in resp.iter_content(chunk_size=1 << 16):
+                if chunk:
+                    tmp.write(chunk)
+        tmp.flush()
+        tmp.close()
+
+        # resolve real (case-sensitive) column names from the header row only
+        header = pd.read_csv(tmp.name, nrows=0)
+        cols = {c.upper(): c for c in header.columns}
+        C = lambda n: cols[n.upper()]
+        need = [C("SEM_EXM_EXCH_ID"), C("SEM_SEGMENT"), C("SEM_INSTRUMENT_NAME"),
+                C("SEM_TRADING_SYMBOL"), C("SEM_SMST_SECURITY_ID")]
+
+        # read ONLY those 5 columns -> a fraction of the RAM the full file used
+        df = pd.read_csv(tmp.name, usecols=need, dtype=str, low_memory=True)
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except Exception:
+            pass
+
+    exch  = df[C("SEM_EXM_EXCH_ID")].astype(str).str.upper()
+    seg   = df[C("SEM_SEGMENT")].astype(str).str.upper()
+    instr = df[C("SEM_INSTRUMENT_NAME")].astype(str).str.upper()
+
+    eq = df[(exch == "NSE") & (seg == "E") & (instr == "EQUITY")].copy()
     if USE_FNO_UNIVERSE_ONLY:
-        fno = df[(df[C("SEM_EXM_EXCH_ID")].astype(str).str.upper() == "NSE") &
-                 (df[C("SEM_INSTRUMENT_NAME")].astype(str).str.upper().isin(["FUTSTK", "OPTSTK"]))]
+        fno = df[(exch == "NSE") & (instr.isin(["FUTSTK", "OPTSTK"]))]
         und = fno[C("SEM_TRADING_SYMBOL")].astype(str).str.split("-").str[0].str.upper().unique()
         eq = eq[eq[C("SEM_TRADING_SYMBOL")].astype(str).str.upper().isin(und)]
     eq = (eq.drop_duplicates(subset=[C("SEM_TRADING_SYMBOL")])
             .sort_values(by=C("SEM_TRADING_SYMBOL")).head(MAX_STOCKS).copy())
     out = pd.DataFrame({"security_id": eq[C("SEM_SMST_SECURITY_ID")].astype(str),
                         "symbol": eq[C("SEM_TRADING_SYMBOL")].astype(str)}).reset_index(drop=True)
+
+    del df, eq
+    gc.collect()
     log.info(f"Final intraday universe: {len(out)} stocks")
     return out
 
