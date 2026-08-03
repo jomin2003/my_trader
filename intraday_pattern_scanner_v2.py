@@ -447,6 +447,17 @@ except Exception as _e:
     _RRGATE_OK = False
     log.info(f"[SCANNER] RR predictor unavailable ({_e})")
 
+# ---- Self-improving loop: adaptive allocator sizing (SHADOW-safe) ----
+# get_weight() returns 1.0 in shadow mode (ALLOC_MODE!=active) -> zero effect.
+# In active mode it returns the learned per-strategy risk weight in [0.4, 1.5].
+try:
+    import adaptive_allocator
+    _ALLOC_OK = True
+    log.info(f"[SCANNER] Adaptive allocator loaded (mode={adaptive_allocator.ALLOC_MODE})")
+except Exception as _e:
+    _ALLOC_OK = False
+    log.info(f"[SCANNER] Adaptive allocator unavailable ({_e})")
+
 # =====================================================================
 # STATE  (all mutated under _POS_LOCK — fix #5)
 # =====================================================================
@@ -637,10 +648,21 @@ def compute_sl_target(entry, direction, atr_val, strategy=None, symbol=None,
         sl = round(entry + sl_dist, 2); tgt = round(entry - rr * sl_dist, 2)
     return sl, tgt, sl_dist
 
-def compute_quantity(entry, sl_dist):
+def compute_quantity(entry, sl_dist, weight: float = 1.0):
+    """Risk-based sizing. `weight` scales the per-trade risk budget so the
+    adaptive allocator can lean into working strategies and de-size bleeding
+    ones. weight=1.0 is the classic behaviour (shadow mode / allocator off).
+    Bounded to the allocator's own [0.4, 1.5] band so a bad value can't
+    over-lever or zero-out a trade."""
     if sl_dist <= 0 or entry <= 0:
         return 0
-    return max(0, min(int(MAX_RISK_PER_TRADE // sl_dist), int(MAX_CAPITAL_PER_TRADE // entry)))
+    try:
+        w = float(weight)
+    except Exception:
+        w = 1.0
+    w = max(0.4, min(1.5, w))
+    risk_budget = MAX_RISK_PER_TRADE * w
+    return max(0, min(int(risk_budget // sl_dist), int(MAX_CAPITAL_PER_TRADE // entry)))
 
 def _order_id(resp):
     if not isinstance(resp, dict):
@@ -775,10 +797,20 @@ def place_bracket_orders(dhan, sig):
     elif rr_override is not None:
         kexit_note = "RR-model (Kronos skipped)"
 
-    qty = compute_quantity(entry_px, sl_dist)
+    # ---- adaptive allocator sizing (1.0x in shadow mode; learned weight in active) ----
+    alloc_w = 1.0
+    if _ALLOC_OK:
+        try:
+            alloc_w = adaptive_allocator.get_weight(strat)
+        except Exception as _e:
+            log.debug(f"[{symbol}] allocator weight skipped: {_e}")
+            alloc_w = 1.0
+    qty = compute_quantity(entry_px, sl_dist, alloc_w)
     if qty <= 0:
         log.info(f"[{symbol}] qty=0 (risk/capital caps) — skip")
         return
+    if _ALLOC_OK and abs(alloc_w - 1.0) > 1e-6:
+        log.info(f"[{symbol}] allocator weight {alloc_w:.2f}x -> qty {qty}")
 
     side = "BUY" if dirn > 0 else "SELL"
     atr_store = float(atr_val) if (atr_val and atr_val > 0) else None
