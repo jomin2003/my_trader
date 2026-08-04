@@ -476,6 +476,7 @@ def telegram_webhook():
                 "Commands:\n"
                 "/status — live status + halt + Kronos + allocator\n"
                 "/report — today's P&L + trades + suggestions\n"
+                "/mlstatus , /models, /config , /decision SYMBOL\n"
                 "/pnl — same as /report\n"
                 "/stop — halt order placement\n"
                 "/resume — re-enable orders (clears auto-halt)\n"
