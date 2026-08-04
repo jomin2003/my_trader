@@ -159,6 +159,12 @@ def boot_restore():
     log.info("=" * 50)
     log.info(f"BOOT at {now_ist().isoformat()}")
     log.info("=" * 50)
+    # [PHASE1] config report — sanitized, secret-safe, log-only
+    try:
+        import config_report
+        log.info("\n" + config_report.format_report(base_dir=BASE_DIR))
+    except Exception as _e:
+        log.warning(f"config report skipped: {_e}")
     try:
         from gist_storage import restore_from_gist
         n = restore_from_gist(BASE_DIR)
@@ -454,6 +460,17 @@ def telegram_webhook():
             except Exception:
                 pass
             tg_send_to(chat_id, "▶️ Trading RESUMED (manual + auto halt cleared).")
+        elif cmd == "mlstatus":
+            import model_diagnostics as _md; tg_send_to(chat_id, _md.mlstatus_text())
+        elif cmd == "models":
+            import model_diagnostics as _md; tg_send_to(chat_id, _md.models_text())
+        elif cmd == "config":
+            import model_diagnostics as _md; tg_send_to(chat_id, _md.config_text(str(BASE_DIR)))
+        elif cmd == "decision":
+            import model_diagnostics as _md
+            _arg = text.split(maxsplit=1)
+            _sym = _arg[1].strip().upper() if len(_arg) > 1 else ""
+            tg_send_to(chat_id, _md.decision_text(_sym) if _sym else "Usage: /decision SYMBOL")
         elif cmd == "help":
             tg_send_to(chat_id,
                 "Commands:\n"

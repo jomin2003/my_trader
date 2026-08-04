@@ -458,6 +458,18 @@ except Exception as _e:
     _ALLOC_OK = False
     log.info(f"[SCANNER] Adaptive allocator unavailable ({_e})")
 
+# [PHASE1] audit imports — decision observability (no-op if AUDIT_ENABLED=0)
+try:
+    import decision_audit as _AUDIT
+    import model_diagnostics as _MDIAG
+    import reason_codes as _RC
+    import config_report as _CFG
+    _AUDIT_OK = True
+    log.info("[SCANNER] decision audit layer loaded")
+except Exception as _e:
+    _AUDIT_OK = False
+    log.info(f"[SCANNER] audit layer unavailable ({_e})")
+
 # =====================================================================
 # STATE  (all mutated under _POS_LOCK — fix #5)
 # =====================================================================
@@ -767,7 +779,7 @@ def place_bracket_orders(dhan, sig):
                     _rrdf = fetch_intraday(dhan, sec_id)
                     _feat = rr_predictor.features_from_ohlc(_rrdf)
                     if _feat is not None:
-                        _rec = rr_predictor.best_rr(_feat, dirn)
+                        _rec, _rr_status, _rr_reasons = rr_predictor.best_rr_ex(_feat, dirn)
                         if _rec:
                             rr_override = (_rec["sl_mult"], _rec["tgt_mult"])
                             log.info(f"[{symbol}] RR model: SL×{_rec['sl_mult']} "
@@ -835,8 +847,35 @@ def place_bracket_orders(dhan, sig):
             _OPEN_POSITIONS[symbol] = pos
             _POSITIONS_OPENED += 1
             _mark_suggestion_acted(symbol, strat)
+        _footer = ""
+        if _AUDIT_OK:
+            try:
+                _MDIAG.COVERAGE.on_signal()
+                _rr_st = ("ACCEPTED" if rr_override else
+                          (rr_predictor.diagnostics().get("status", "DISABLED") if _RRGATE_OK else "na"))
+                if rr_override:
+                    _MDIAG.COVERAGE.on_accept(symbol)
+                _dec = _AUDIT.DecisionRecord(
+                    decision_id=_AUDIT.make_decision_id(strat, symbol, side),
+                    symbol=symbol, strategy=strat, side=side,
+                    signal_time=now_ist().isoformat(),
+                    baseline_exit_source=("structure" if (struct_sl and struct_tgt) else "atr"),
+                    final_exit_source=("rr_model" if rr_override else
+                                       ("structure" if (struct_sl and struct_tgt) else "atr")),
+                    direction_gate="passed", rr_model_status=_rr_st,
+                    kronos_status=("bypassed_rr_owns_exit" if rr_override else "na"),
+                    allocator_mode=(adaptive_allocator.ALLOC_MODE if _ALLOC_OK else "shadow"),
+                    risk_weight=float(alloc_w),
+                    model_version=(rr_predictor.diagnostics().get("model_version") if _RRGATE_OK else None),
+                    config_version=_CFG.config_version(),
+                    stop_price=sl, target_price=tgt, expected_rr=RISK_REWARD_RATIO, qty=qty)
+                _AUDIT.record(_dec)
+                _AUDIT.order_submitted(symbol=symbol, decision_id=_dec.decision_id, mode="paper")
+                _footer = "\n" + _dec.telegram_line()
+            except Exception as _e:
+                log.debug(f"[{symbol}] decision record skipped: {_e}")
         tg_send(f"🧪 <b>PAPER ENTRY</b> {symbol} {side} [{strat}]\n"
-                f"₹{entry_px} | SL ₹{sl} | TGT ₹{tgt} | Qty {qty}", silent=True)
+                f"₹{entry_px} | SL ₹{sl} | TGT ₹{tgt} | Qty {qty}" + _footer, silent=True)
         log.info(f"[{symbol}] PAPER {side} qty={qty} entry={entry_px} sl={sl} tgt={tgt}")
         return
 
