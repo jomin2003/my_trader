@@ -8,3 +8,4 @@ dhanhq>=2.0.0
 yfinance>=0.2.40
 pyotp>=2.9.0
 lightgbm>=4.3.0
+PyYAML>=6.0
