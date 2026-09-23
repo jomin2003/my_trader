@@ -1,0 +1,39 @@
+# =====================================================================
+# NEVER commit these to git
+# =====================================================================
+
+# Secrets & credentials
+.env
+.env.*
+*.pem
+*.key
+*.token
+credentials.json
+
+# Runtime state (Render persistent disk holds these)
+live_config.json
+state.json
+logs/
+data/
+backtest_out/
+sweep_out/
+mc_out/
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo

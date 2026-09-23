@@ -1,0 +1,8 @@
+# Tier-2 volatility trainer deps (for the nightly GitHub Actions job ONLY).
+# Your live scanner/app do NOT need these — vol_gate.py uses only stdlib+requests.
+lightgbm>=4.3.0
+scikit-learn>=1.3.0
+pandas>=2.0.0
+numpy>=1.24.0
+requests>=2.31.0
+yfinance>=0.2.40
