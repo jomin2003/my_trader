@@ -225,7 +225,10 @@ def load_universe_fno_from_dhan_master() -> list[str]:
     ]
     unders = (fno[C("SEM_TRADING_SYMBOL")].astype(str)
               .str.split("-").str[0].str.upper().unique().tolist())
-    unders = sorted({u for u in unders if u.isalnum() or "&" in u or "-" in u})
+    unders = sorted({
+        u for u in unders
+        if (u.isalnum() or "&" in u or "-" in u) and "NSETEST" not in u
+    })
     log.info(f"F&O underlyings found: {len(unders)}")
     return unders
 
@@ -244,16 +247,22 @@ def resolve_universe(preset: str, symbols_file: str | None) -> list[str]:
 
 
 # =====================================================================
-# YFINANCE SOURCE
+# YFINANCE / YAHOO FAST CHART SOURCE
 # =====================================================================
 def _yf_ticker(sym: str) -> str:
-    """Map NSE symbol -> yfinance ticker."""
-    if sym.upper() in ("NIFTY", "NIFTY50", "^NSEI"):
+    """Map NSE symbol -> Yahoo Finance ticker."""
+    try:
+        from free_data_provider import to_yahoo_ticker
+        return to_yahoo_ticker(sym)
+    except Exception:
+        pass
+    if sym.upper() in ("NIFTY", "NIFTY50", "^NSEI", "13"):
         return "^NSEI"
-    # yfinance uses "-" oddly; handle a couple of known irregulars
     fixes = {
-        "M&M":       "M%26M.NS",
+        "M&M":        "M&M.NS",
         "BAJAJ-AUTO": "BAJAJ-AUTO.NS",
+        "TATAMOTORS": "TMPV.NS",
+        "ZOMATO":     "ETERNAL.NS",
     }
     return fixes.get(sym.upper(), f"{sym.upper()}.NS")
 
@@ -261,12 +270,22 @@ def _yf_ticker(sym: str) -> str:
 def fetch_yf(sym: str, period_days: int, retries: int = 2) -> pd.DataFrame | None:
     """
     Fetch 5-min bars for the last `period_days` (max ~60 for 5m interval).
-    Uses yfinance. Returns a DataFrame in canonical schema or None.
+    Tries the fast Yahoo v8 chart API first via FreeMarketDataClient, then
+    falls back to the yfinance library. Returns a DataFrame in canonical schema or None.
     """
+    try:
+        from free_data_provider import get_free_client
+        fc = get_free_client()
+        df_fast = fc.fetch_bars_df(sym, interval=5, days_back=min(period_days, 59))
+        if df_fast is not None and not df_fast.empty:
+            return _standardize(df_fast)
+    except Exception:
+        pass
+
     try:
         import yfinance as yf
     except ImportError:
-        raise SystemExit("yfinance not installed. Run: pip install yfinance")
+        return None
 
     ticker = _yf_ticker(sym)
     # yfinance caps 5m interval at ~60 days; clamp to be safe
@@ -404,7 +423,7 @@ def run_yfinance(symbols: list[str], out_dir: Path, days: int, sleep: float):
     log.info(f"Done. Kept {kept}/{len(symbols)} symbols.")
 
 
-def run_dhan(symbols: list[str], out_dir: Path, days: int, sleep: float):
+def run_dhan(symbols: list[str], out_dir: Path, days: int, sleep: float) -> int:
     dhan = _dhan_client()
     log.info("Building Dhan security-id map ...")
     eq_map, idx_map = build_dhan_symbol_map()
@@ -432,19 +451,20 @@ def run_dhan(symbols: list[str], out_dir: Path, days: int, sleep: float):
         log.info(f"  NIFTY index: +{added} new, {total} total rows")
 
     log.info(f"Done. Kept {kept}/{len(symbols)} symbols.")
+    return kept
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["yfinance", "dhan"], default="yfinance")
+    ap.add_argument("--mode", choices=["auto", "free", "yfinance", "dhan"], default="auto")
     ap.add_argument("--preset", choices=["nifty50", "fno"], default="nifty50")
     ap.add_argument("--symbols-file", type=str, default="",
                     help="Optional: text file with one NSE symbol per line")
     ap.add_argument("--out", type=str, default="./data",
                     help="Output directory for <SYMBOL>.csv files")
     ap.add_argument("--days", type=int, default=59,
-                    help="How many trailing days to fetch. yfinance max=59, dhan max~5")
-    ap.add_argument("--sleep", type=float, default=0.4,
+                    help="How many trailing days to fetch. yfinance/free max=59, dhan max~5")
+    ap.add_argument("--sleep", type=float, default=0.05,
                     help="Delay (seconds) between symbol requests")
     args = ap.parse_args()
 
@@ -453,18 +473,37 @@ def main():
 
     symbols = resolve_universe(args.preset, args.symbols_file or None)
 
+    mode = args.mode
+    if mode == "auto":
+        pref = (os.getenv("MARKET_DATA_PROVIDER") or "auto").strip().lower()
+        cid = os.getenv("DHAN_CLIENT_ID")
+        tok = os.getenv("DHAN_ACCESS_TOKEN")
+        if pref == "dhan" and cid and tok and args.days <= 5:
+            mode = "dhan"
+        else:
+            mode = "yfinance"
+    elif mode == "free":
+        mode = "yfinance"
+
     # Clamp days per source
-    if args.mode == "yfinance" and args.days > 59:
+    if mode == "yfinance" and args.days > 59:
         log.warning(f"yfinance caps 5-min data at ~60 days; clamping days={args.days}->59")
         args.days = 59
-    if args.mode == "dhan" and args.days > 5:
+    if mode == "dhan" and args.days > 5:
         log.warning(f"Dhan intraday only returns ~5 days; clamping days={args.days}->5")
         args.days = 5
 
-    if args.mode == "yfinance":
+    if mode == "yfinance":
         run_yfinance(symbols, out_dir, args.days, args.sleep)
     else:
-        run_dhan(symbols, out_dir, args.days, args.sleep)
+        try:
+            kept = run_dhan(symbols, out_dir, args.days, args.sleep)
+            if kept == 0:
+                log.warning("Dhan download returned 0 symbols — falling back to free/yfinance feed")
+                run_yfinance(symbols, out_dir, min(max(args.days, 25), 59), 0.05)
+        except BaseException as e:
+            log.warning(f"Dhan download failed ({e}) — falling back to free/yfinance feed")
+            run_yfinance(symbols, out_dir, min(max(args.days, 25), 59), 0.05)
 
     # Summary of what we now have
     csvs = sorted(out_dir.glob("*.csv"))

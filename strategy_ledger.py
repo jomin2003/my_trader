@@ -134,16 +134,17 @@ def append_today(trades: list[dict], nifty_trend: int = 0,
     # skewed the bandit weights. Dedupe on the natural key; also skip PARTIAL legs
     # (one round trip was learned as two independent trades, corrupting
     # expectancy/win-rate/PF for any partial-using strategy).
-    seen = {(r.get("date"), r.get("strategy"), r.get("side"), r.get("outcome"),
-             r.get("pnl"), r.get("r")) for r in rows if r.get("date") == today}
+    seen = {(r.get("date"), r.get("symbol", ""), r.get("strategy"), r.get("side"),
+             r.get("outcome"), r.get("pnl"), r.get("r"), r.get("time", ""))
+            for r in rows if r.get("date") == today}
     appended = 0
     for t in trades:
         if str(t.get("outcome", "")).upper() == "PARTIAL":
             continue
-        # parse the kronos tag into a compact label
+        # parse the kronos tag into a compact label (check "disagree" before "agree"!)
         kro = str(t.get("kronos", "")).lower()
-        kro_label = ("agree" if "agree" in kro else
-                     "disagree" if "disagree" in kro else
+        kro_label = ("disagree" if "disagree" in kro else
+                     "agree" if "agree" in kro else
                      "na")
         # hour of day from the trade's time string (HH:MM:SS)
         hour = None
@@ -151,18 +152,22 @@ def append_today(trades: list[dict], nifty_trend: int = 0,
             hour = int(str(t.get("time", "")).split(":")[0])
         except Exception:
             pass
+        pnl_val = float(t.get("total_pnl", t.get("pnl", 0.0)))
         row = {
             "date":     today,
+            "symbol":   str(t.get("symbol", "")),
             "strategy": t.get("strategy", "?"),
             "side":     t.get("side", ""),
-            "pnl":      float(t.get("pnl", 0.0)),
+            "pnl":      pnl_val,
             "r":        float(t.get("r", 0.0)),
             "outcome":  t.get("outcome", ""),
             "nifty":    int(nifty_trend),
             "kronos":   kro_label,
             "hour":     hour,
+            "time":     str(t.get("time", "")),
         }
-        key = (row["date"], row["strategy"], row["side"], row["outcome"], row["pnl"], row["r"])
+        key = (row["date"], row["symbol"], row["strategy"], row["side"],
+               row["outcome"], row["pnl"], row["r"], row["time"])
         if key in seen:
             continue
         seen.add(key)
@@ -173,7 +178,7 @@ def append_today(trades: list[dict], nifty_trend: int = 0,
     if len(rows) > LEDGER_MAX_TRADES:
         led["trades"] = rows[-LEDGER_MAX_TRADES:]
     save_ledger(led, base_dir)
-    log.info(f"ledger: appended {len(trades)} trades (total {len(led['trades'])})")
+    log.info(f"ledger: appended {appended} trades (total {len(led['trades'])})")
     return led
 
 # ---------------------------------------------------------------------

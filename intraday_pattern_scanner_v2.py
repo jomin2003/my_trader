@@ -244,6 +244,9 @@ def passes_nifty_gate(direction, ntrend):
 INSTRUMENT_MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
 USE_FNO_UNIVERSE_ONLY = True
 
+# =====================================================================
+# HISTORICAL DATA & UNIVERSE
+# =====================================================================
 def load_intraday_universe() -> pd.DataFrame:
     import tempfile, gc
     log.info("Downloading Dhan instrument master ...")
@@ -261,6 +264,13 @@ def load_intraday_universe() -> pd.DataFrame:
         need = [C("SEM_EXM_EXCH_ID"), C("SEM_SEGMENT"), C("SEM_INSTRUMENT_NAME"),
                 C("SEM_TRADING_SYMBOL"), C("SEM_SMST_SECURITY_ID")]
         df = pd.read_csv(tmp.name, usecols=need, dtype=str, low_memory=True)
+    except Exception as e:
+        log.warning(f"Scrip master download failed ({e}); using built-in NIFTY50/F&O fallback universe")
+        try:
+            import free_data_provider as _fdp
+            return _fdp.get_fallback_universe_df().head(MAX_STOCKS)
+        except Exception:
+            return pd.DataFrame(columns=["security_id", "symbol"])
     finally:
         try: os.unlink(tmp.name)
         except Exception: pass
@@ -269,9 +279,15 @@ def load_intraday_universe() -> pd.DataFrame:
     seg   = df[C("SEM_SEGMENT")].astype(str).str.upper()
     instr = df[C("SEM_INSTRUMENT_NAME")].astype(str).str.upper()
     eq = df[(exch == "NSE") & (seg == "E") & (instr == "EQUITY")].copy()
+    eq_sym = eq[C("SEM_TRADING_SYMBOL")].astype(str).str.split("-").str[0].str.upper().str.strip()
+    eq = eq[~eq_sym.str.contains("NSETEST", na=False)].copy()
+    eq[C("SEM_TRADING_SYMBOL")] = eq_sym[~eq_sym.str.contains("NSETEST", na=False)]
     if USE_FNO_UNIVERSE_ONLY:
         fno = df[(exch == "NSE") & (instr.isin(["FUTSTK", "OPTSTK"]))]
-        und = fno[C("SEM_TRADING_SYMBOL")].astype(str).str.split("-").str[0].str.upper().unique()
+        und = {
+            u for u in fno[C("SEM_TRADING_SYMBOL")].astype(str).str.split("-").str[0].str.upper().unique()
+            if "NSETEST" not in str(u)
+        }
         eq = eq[eq[C("SEM_TRADING_SYMBOL")].astype(str).str.upper().isin(und)]
     eq = (eq.drop_duplicates(subset=[C("SEM_TRADING_SYMBOL")])
             .sort_values(by=C("SEM_TRADING_SYMBOL")).head(MAX_STOCKS).copy())
@@ -279,13 +295,15 @@ def load_intraday_universe() -> pd.DataFrame:
                         "symbol": eq[C("SEM_TRADING_SYMBOL")].astype(str)}).reset_index(drop=True)
     del df, eq
     gc.collect()
+    try:
+        import free_data_provider as _fdp
+        _fdp.register_universe_mapping(out)
+    except Exception:
+        pass
     log.info(f"Final intraday universe: {len(out)} stocks")
     return out
 
 
-# =====================================================================
-# HISTORICAL DATA
-# =====================================================================
 def fetch_intraday(dhan, security_id):
     today = datetime.now(IST).strftime("%Y-%m-%d")
     try:
@@ -316,32 +334,66 @@ def fetch_intraday(dhan, security_id):
     df = df.iloc[:-1].reset_index(drop=True)
     return df if len(df) >= MIN_CANDLES_NEEDED - 1 else None
 
+def _extract_quote_rec(q, security_id):
+    if not isinstance(q, dict):
+        return None
+    d = q.get("data")
+    if isinstance(d, dict) and "data" in d and isinstance(d["data"], dict):
+        d = d["data"]
+    if not isinstance(d, dict):
+        return None
+    seg = d.get("NSE_EQ")
+    if isinstance(seg, dict):
+        rec = seg.get(str(security_id))
+        if rec is None:
+            try:
+                rec = seg.get(int(security_id))
+            except Exception:
+                rec = None
+        if isinstance(rec, dict):
+            return rec
+    rec = d.get(str(security_id)) or d
+    return rec if isinstance(rec, dict) else None
+
 def _latest_bar(dhan, security_id):
     if not security_id: return None
     # Prefer the real-time quote: the last completed 5-min bar can be 5+ minutes old,
     # and SL/target detection on stale bars diverges from the resting broker SLM.
     try:
-        if hasattr(dhan, "quoteData"):
-            q = dhan.quoteData(security_id=security_id, exchange_segment="NSE_EQ")
-            d = q.get("data") if isinstance(q, dict) else None
-            if isinstance(d, dict):
-                rec = d.get(str(security_id)) or d
-                ltp = float(rec.get("last_price") or rec.get("ltp") or 0)
-                if ltp > 0:
-                    df = fetch_intraday(dhan, security_id) or None
-                    hi = float(rec.get("high") or 0)
-                    lo = float(rec.get("low") or 0)
-                    if df is not None and not df.empty:
-                        hi = max(hi, float(df["high"].max()))
-                        lo_candidates = [x for x in (lo, float(df["low"].min())) if x > 0]
-                        lo = min(lo_candidates) if lo_candidates else ltp
-                    return {"high": max(hi, ltp), "low": min(lo, ltp) if lo > 0 else ltp, "close": ltp}
+        q = None
+        if hasattr(dhan, "quote_data"):
+            try:
+                sid_val = int(security_id) if str(security_id).isdigit() else str(security_id)
+                q = dhan.quote_data({"NSE_EQ": [sid_val]})
+            except TypeError:
+                q = None
+        if q is None and hasattr(dhan, "quoteData"):
+            try:
+                q = dhan.quoteData(security_id=security_id, exchange_segment="NSE_EQ")
+            except TypeError:
+                sid_val = int(security_id) if str(security_id).isdigit() else str(security_id)
+                q = dhan.quoteData({"NSE_EQ": [sid_val]})
+        rec = _extract_quote_rec(q, security_id)
+        if isinstance(rec, dict):
+            ltp = float(rec.get("last_price") or rec.get("LTP") or rec.get("ltp") or 0)
+            if ltp > 0:
+                ohlc = rec.get("ohlc") if isinstance(rec.get("ohlc"), dict) else {}
+                hi = float(rec.get("high") or ohlc.get("high") or ltp)
+                lo = float(rec.get("low") or ohlc.get("low") or ltp)
+                return {
+                    "high": max(hi, ltp),
+                    "low": min(lo, ltp) if lo > 0 else ltp,
+                    "close": ltp,
+                }
     except Exception:
         pass
     df = fetch_intraday(dhan, security_id)
     if df is None or df.empty: return None
     last = df.iloc[-1]
-    return {"high": float(last["high"]), "low": float(last["low"]), "close": float(last["close"])}
+    out = {"high": float(last["high"]), "low": float(last["low"]), "close": float(last["close"])}
+    if "ts" in df.columns and pd.notna(last.get("ts")):
+        out["ts"] = last["ts"]
+    return out
 
 
 # =====================================================================
@@ -405,26 +457,47 @@ _strategy_exits_mod = _load_strategy_exits()
 # =====================================================================
 # KRONOS / RR / VOL GATE SETUP (lazy imports)
 # =====================================================================
+kronos_gate = None
+kronos_exits = None
+vol_gate = None
+rr_predictor = None
+decision_audit = None
+model_diagnostics = None
+_LAST_RESTORE_DATE = None
+
 def _init_gates():
-    global _KRONOS_OK, _KEXIT_OK, _VOLGATE_OK, _RRGATE_OK
+    global _KRONOS_OK, _KEXIT_OK, _VOLGATE_OK, _RRGATE_OK, _AUDIT_OK
+    global kronos_gate, kronos_exits, vol_gate, rr_predictor, decision_audit, model_diagnostics
     try:
-        import kronos_gate
+        import kronos_gate as _kg
+        kronos_gate = _kg
         _KRONOS_OK = True
     except Exception:
         pass
     try:
-        import kronos_exits
+        import kronos_exits as _ke
+        kronos_exits = _ke
         _KEXIT_OK = True
     except Exception:
         pass
     try:
-        import vol_gate
+        import vol_gate as _vg
+        vol_gate = _vg
         _VOLGATE_OK = True
     except Exception:
         pass
     try:
-        import rr_predictor
+        import rr_predictor as _rrp
+        rr_predictor = _rrp
         _RRGATE_OK = True
+    except Exception:
+        pass
+    try:
+        import decision_audit as _da
+        import model_diagnostics as _md
+        decision_audit = _da
+        model_diagnostics = _md
+        _AUDIT_OK = True
     except Exception:
         pass
 
@@ -436,12 +509,14 @@ _init_gates()
 # =====================================================================
 _risk_limits = None
 _exposure_tracker = None
+_check_new_entry_fn = None
 
 def _init_risk():
-    global _risk_limits, _exposure_tracker
+    global _risk_limits, _exposure_tracker, _check_new_entry_fn
     try:
         from portfolio_risk import RiskLimits, check_new_entry
         from exposure_tracker import ExposureTracker
+        _check_new_entry_fn = check_new_entry
         _risk_limits = RiskLimits(
             max_portfolio_heat=MAX_PORTFOLIO_HEAT,
             max_symbol_notional=MAX_CAPITAL_PER_TRADE,
@@ -457,10 +532,10 @@ _init_risk()
 
 def _check_portfolio_risk(candidate) -> tuple[bool, list[str]]:
     """Check if a new entry would violate portfolio risk limits."""
-    if _risk_limits is None or _exposure_tracker is None:
+    if _risk_limits is None or _exposure_tracker is None or _check_new_entry_fn is None:
         return True, []
     positions = list(_OPEN_POSITIONS.values())
-    ok, reasons = check_new_entry(candidate, positions, _risk_limits, _exposure_tracker)
+    ok, reasons = _check_new_entry_fn(candidate, positions, _risk_limits, _exposure_tracker)
     return ok, reasons
 
 
@@ -482,37 +557,45 @@ def _mark_suggestion_acted(symbol, strategy):
         if s["symbol"] == symbol and s["strategy"] == strategy and not s["acted"]:
             s["acted"] = True; break
 
-def _record_trade(sym, pos, outcome, exit_price, qty, pnl):
+def _record_trade(sym, pos, outcome, exit_price, qty, pnl, total_pnl=None):
     direction = 1 if pos["side"] == "BUY" else -1
     init_sl_dist = max(pos.get("init_sl_dist", 0.0), 1e-9)
     r_multiple = round(((exit_price - pos["entry"]) * direction) / init_sl_dist, 2)
-    _COMPLETED_TRADES.append({
+    rec = {
         "symbol": sym, "strategy": pos.get("strategy", "?"),
         "side": pos["side"], "outcome": outcome,
         "entry": round(pos["entry"], 2), "exit": round(exit_price, 2),
         "qty": int(qty), "pnl": round(pnl, 2), "r": r_multiple,
         "kexit": pos.get("kexit", ""),
+        "kronos": pos.get("kronos", ""),
         "time": datetime.now(IST).strftime("%H:%M:%S"),
-    })
+    }
+    if total_pnl is not None:
+        rec["total_pnl"] = round(total_pnl, 2)
+    _COMPLETED_TRADES.append(rec)
 
 def _finalize(sym):
     _OPEN_POSITIONS.pop(sym, None)
 
 def reset_day():
-    global _POSITIONS_OPENED, _TRADING_HALTED_TODAY, _HALT_REASON, _CONSECUTIVE_LOSSES
+    global _POSITIONS_OPENED, _TRADING_HALTED_TODAY, _HALT_REASON, _CONSECUTIVE_LOSSES, _LAST_RESTORE_DATE
     with _POS_LOCK:
-        # FIX: boot_restore revives TODAY's open positions; the first /trigger/scan then
-        # called reset_day (fresh process, _UNIVERSE None) which wiped them and the next
-        # snapshot overwrote the Gist with empty state — crash recovery was undone.
-        # Only reset when the open positions are genuinely from a previous day.
-        # A position WITHOUT opened_at cannot be proven current → always cleared.
+        today = datetime.now(IST).date()
+        # FIX: boot_restore revives TODAY's open positions and/or completed trades / halts;
+        # the first /trigger/scan then called reset_day (fresh process, _UNIVERSE None)
+        # which wiped them and the next snapshot overwrote the Gist with empty state.
+        # Only reset when open positions or restored state are from a previous day.
         open_days = set(); undated = False
         for p in _OPEN_POSITIONS.values():
             oa = p.get("opened_at")
             if oa is None: undated = True
             else: open_days.add(oa.date())
-        if _OPEN_POSITIONS and not undated and open_days == {datetime.now(IST).date()}:
+        if _OPEN_POSITIONS and not undated and open_days == {today}:
             log.info("reset_day: same-day state (restored positions) — skipping reset")
+            return
+        if not _OPEN_POSITIONS and _LAST_RESTORE_DATE == today:
+            log.info("reset_day: same-day restored state (no open positions) — skipping reset")
+            _LAST_RESTORE_DATE = None
             return
         if _OPEN_POSITIONS:
             log.warning(f"reset_day: {len(_OPEN_POSITIONS)} position(s) still open")
@@ -520,7 +603,7 @@ def reset_day():
         _SIGNALS_TODAY.clear(); _COMPLETED_TRADES.clear()
         _TRADED_TODAY.clear(); _SYMBOL_COOLDOWN.clear()
         _POSITIONS_OPENED = 0; _TRADING_HALTED_TODAY = False
-        _HALT_REASON = ""; _CONSECUTIVE_LOSSES = 0
+        _HALT_REASON = ""; _CONSECUTIVE_LOSSES = 0; _LAST_RESTORE_DATE = None
     log.info("Day state reset")
 
 
@@ -619,10 +702,17 @@ def compute_quantity(entry, sl_dist, weight=1.0):
 # =====================================================================
 BACKOFF_ON_ERROR_SEC = 2.0
 
+def _is_finite_pos(val) -> bool:
+    try:
+        v = float(val)
+        return bool(np.isfinite(v) and v > 0)
+    except Exception:
+        return False
+
 def _order_id(resp):
     if not isinstance(resp, dict): return None
-    data = resp.get("data") or {}
-    return data.get("orderId") or data.get("order_id")
+    data = resp.get("data") if isinstance(resp.get("data"), dict) else resp
+    return (data or {}).get("orderId") or (data or {}).get("order_id") or resp.get("orderId") or resp.get("order_id")
 
 def _cancel(dhan, oid):
     if not oid: return
@@ -636,17 +726,35 @@ def _order_status(dhan, oid):
         r = dhan.get_order_by_id(oid)
         d = r.get("data") if isinstance(r, dict) else None
         if isinstance(d, list) and d: d = d[0]
-        return (d or {}).get("order_status")
+        if isinstance(d, dict):
+            return d.get("orderStatus") or d.get("order_status")
+        if isinstance(r, dict):
+            return r.get("orderStatus") or r.get("order_status")
+        return None
     except Exception:
         return None
 
-def _place(dhan, sec_id, side, qty, order_type, price=0, trigger_price=None):
+def _is_order_filled(status) -> bool:
+    if not status:
+        return False
+    s = str(status).strip().upper()
+    return ("FILL" in s) or (s in ("TRADED", "COMPLETE", "COMPLETED"))
+
+def _place(dhan, sec_id, side, qty, order_type, price=0, trigger_price=0):
     try:
+        otype = str(order_type or "MARKET").upper()
+        if otype in ("SLM", "SL-M"):
+            # Dhan SDK v2 defines STOP_LOSS_MARKET = "STOP_LOSS_MARKET"; pass canonical
+            # name if using real Dhan SDK while preserving compatibility with test doubles.
+            if getattr(dhan, "STOP_LOSS_MARKET", None):
+                otype = dhan.STOP_LOSS_MARKET
+        trig = float(trigger_price) if trigger_price is not None and _is_finite_pos(trigger_price) else 0.0
+        px = float(price) if price is not None and _is_finite_pos(price) else 0.0
         return dhan.place_order(
             security_id=sec_id, exchange_segment="NSE_EQ",
-            transaction_type=side, quantity=qty,
-            product_type="INTRADAY", order_type=order_type,
-            price=price, trigger_price=trigger_price)
+            transaction_type=side, quantity=int(qty),
+            product_type="INTRADAY", order_type=otype,
+            price=px, trigger_price=trig)
     except Exception:
         return None
 
@@ -688,7 +796,7 @@ def _live_exit(dhan, pos, filled_leg_id=None):
     try:
         if filled_leg_id:
             st = _order_status(dhan, filled_leg_id)
-            if st and "FILL" in str(st).upper():
+            if _is_order_filled(st):
                 _cancel_protection(dhan, pos)
                 return
         _cancel_protection(dhan, pos)
@@ -718,43 +826,69 @@ def place_bracket_orders(dhan, sig):
     global _POSITIONS_OPENED
     symbol = sig["symbol"]; sec_id = sig["security_id"]; entry_px = float(sig["price"])
     dirn = int(sig["direction"]); atr_val = sig.get("atr"); strat = sig.get("strategy", "?")
+    side = "BUY" if dirn > 0 else "SELL"
 
     # Determine SL/TGT FIRST so heat gate sees real risk (fix: old code checked
     # heat with sl=0/qty=0 which is always 0 heat => gate was a no-op).
     struct_sl = sig.get("struct_sl"); struct_tgt = sig.get("struct_target")
     rr_override = None
-    if struct_sl and struct_tgt:
+    rr_status_str = "DISABLED"
+    baseline_exit_src = "atr"
+    final_exit_src = "atr"
+    kexit_note = ""
+
+    if _is_finite_pos(struct_sl) and _is_finite_pos(struct_tgt):
         sl = float(struct_sl); tgt = float(struct_tgt); sl_dist = abs(entry_px - sl)
+        baseline_exit_src = "structure"
+        final_exit_src = "structure"
     else:
-        if _RRGATE_OK:
+        if _RRGATE_OK and rr_predictor is not None:
             try:
                 if rr_predictor.enabled():
+                    if _AUDIT_OK and model_diagnostics is not None:
+                        model_diagnostics.COVERAGE.on_attempt()
                     _rrdf = fetch_intraday(dhan, sec_id)
                     _feat = rr_predictor.features_from_ohlc(_rrdf)
                     if _feat is not None:
-                        _rec, _rr_status, _ = rr_predictor.best_rr_ex(_feat, dirn)
-                        if _rec: rr_override = (_rec["sl_mult"], _rec["tgt_mult"])
-            except Exception: pass
+                        _rec, rr_status_str, _ = rr_predictor.best_rr_ex(_feat, dirn)
+                        if _rec:
+                            rr_override = (_rec["sl_mult"], _rec["tgt_mult"])
+                            final_exit_src = "rr_model"
+                            if _AUDIT_OK and model_diagnostics is not None:
+                                model_diagnostics.COVERAGE.on_accept(symbol)
+                        elif _AUDIT_OK and model_diagnostics is not None:
+                            model_diagnostics.COVERAGE.on_fallback(rr_status_str)
+                    else:
+                        rr_status_str = "FEATURE_FAIL"
+                        if _AUDIT_OK and model_diagnostics is not None:
+                            model_diagnostics.COVERAGE.on_fallback(rr_status_str)
+            except Exception:
+                pass
         sl, tgt, sl_dist = compute_sl_target(entry_px, dirn, atr_val, strat, symbol, rr_override)
 
-    if sl_dist <= 0: return
+    if not _is_finite_pos(sl_dist): return
 
-    # Kronos-adaptive exits (skip if RR model already set levels)
-    if _KEXIT_OK and rr_override is None:
+    # Kronos-adaptive exits (skip if RR model or structure already set levels)
+    if _KEXIT_OK and kronos_exits is not None and rr_override is None and final_exit_src == "atr":
         try:
             new_sl_dist, tgt, kexit_note = kronos_exits.adjust_exits(
                 symbol, dirn, entry_px, sl_dist, tgt, rr=RISK_REWARD_RATIO)
-            sl_dist = new_sl_dist
-            sl = round(entry_px - dirn * sl_dist, 2)
+            if _is_finite_pos(new_sl_dist):
+                sl_dist = new_sl_dist
+                sl = round(entry_px - dirn * sl_dist, 2)
+                if kexit_note:
+                    final_exit_src = "kronos"
         except Exception: pass
 
     # Adaptive allocator sizing (shadow mode -> 1.0, no effect; active mode ->
     # per-strategy weight from the EOD allocator run).
     alloc_w = 1.0
+    alloc_mode = "shadow"
     try:
         import adaptive_allocator as _alloc
         from config_registry import StrategyName as _SN
         alloc_w = _alloc.get_weight(_SN.normalize(strat))
+        alloc_mode = getattr(_alloc, "ALLOC_MODE", "shadow")
     except Exception:
         alloc_w = 1.0
     qty = compute_quantity(entry_px, sl_dist, alloc_w)
@@ -762,21 +896,48 @@ def place_bracket_orders(dhan, sig):
 
     # Portfolio heat gate with REAL sl/qty (enforces MAX_PORTFOLIO_HEAT=2000).
     # With 5 x Rs500 risk = Rs2500, the 5th trade is correctly blocked.
-    side_tmp = "BUY" if dirn > 0 else "SELL"
     candidate = {"symbol": symbol, "entry": entry_px, "sl": sl,
-                 "qty": qty, "side": side_tmp, "strategy": strat}
+                 "qty": qty, "side": side, "strategy": strat}
     portfolio_ok, portfolio_reasons = _check_portfolio_risk(candidate)
     if not portfolio_ok:
         log.info(f"[{symbol}] portfolio risk blocked: {portfolio_reasons}")
+        if _AUDIT_OK and decision_audit is not None:
+            try:
+                decision_audit.signal_rejected(symbol=symbol, strategy=strat, reasons=portfolio_reasons)
+            except Exception:
+                pass
         return
 
-    side = "BUY" if dirn > 0 else "SELL"
+    # Record decision audit for /decision SYMBOL and /mlstatus
+    if _AUDIT_OK and decision_audit is not None:
+        try:
+            exp_rr = round(abs(tgt - entry_px) / max(sl_dist, 1e-9), 2)
+            dec = decision_audit.DecisionRecord(
+                decision_id=decision_audit.make_decision_id(strat, symbol, side),
+                symbol=symbol, strategy=strat, side=side,
+                signal_time=str(sig.get("time") or datetime.now(IST).strftime("%H:%M:%S")),
+                baseline_exit_source=baseline_exit_src,
+                final_exit_source=final_exit_src,
+                direction_gate="pass",
+                rr_model_status=rr_status_str,
+                kronos_status=str(sig.get("kronos") or "na"),
+                allocator_mode=str(alloc_mode),
+                risk_weight=float(alloc_w),
+                config_version=cfg.version() if hasattr(cfg, "version") else None,
+                stop_price=sl, target_price=tgt, expected_rr=exp_rr,
+                qty=qty, outcome="submitted",
+            )
+            decision_audit.record(dec)
+        except Exception:
+            pass
+
     pos = {
         "symbol": symbol, "security_id": sec_id, "side": side,
         "entry": entry_px, "sl": sl, "target": tgt, "qty": qty,
-        "init_sl_dist": sl_dist, "atr": float(atr_val) if atr_val and atr_val > 0 else None,
+        "init_sl_dist": sl_dist, "atr": float(atr_val) if _is_finite_pos(atr_val) else None,
         "strategy": strat, "pattern": sig.get("pattern", ""),
-        "kexit": "", "sl_id": None, "tgt_id": None,
+        "kexit": kexit_note or "", "kronos": sig.get("kronos", ""),
+        "sl_id": None, "tgt_id": None,
         "opened_at": datetime.now(IST), "partial_done": False, "be_done": False,
         "best_fav": 0.0, "best_price": entry_px, "last_price": entry_px,
         "realized": 0.0,
@@ -787,6 +948,7 @@ def place_bracket_orders(dhan, sig):
             block = _entry_blocked(symbol)  # paper: risk caps only, allowlist is live-only
             if block: return
             _OPEN_POSITIONS[symbol] = pos; _POSITIONS_OPENED += 1
+            _TRADED_TODAY.add(symbol)
             _mark_suggestion_acted(symbol, strat)
         _emit("trade_entered", {"symbol": symbol, "strategy": strat, "side": side,
                                 "entry": entry_px, "qty": qty}, "scanner")
@@ -794,6 +956,9 @@ def place_bracket_orders(dhan, sig):
         return
 
     # LIVE
+    with _POS_LOCK:
+        block = _entry_blocked(symbol, strat)
+        if block: return
     try:
         entry_resp = _place(dhan, sec_id, side, qty, "MARKET", price=0)
     except Exception as e:
@@ -813,6 +978,7 @@ def place_bracket_orders(dhan, sig):
     pos["sl_id"] = sl_id; pos["tgt_id"] = tgt_id
     with _POS_LOCK:
         _OPEN_POSITIONS[symbol] = pos; _POSITIONS_OPENED += 1
+        _TRADED_TODAY.add(symbol)
         _mark_suggestion_acted(symbol, strat)
     _emit("trade_entered", {"symbol": symbol, "strategy": strat, "side": side,
                             "entry": entry_px, "qty": qty}, "scanner")
@@ -871,7 +1037,7 @@ def _close_and_record(dhan, sym, pos, outcome, exit_price, filled_leg_id=None):
     leg_pnl = _apply_costs(pos["entry"], exit_price, pos["qty"], pos["side"])
     trade_total = round(pos.get("realized", 0.0) + leg_pnl, 2)
     with _POS_LOCK:
-        _record_trade(sym, pos, outcome, exit_price, pos["qty"], leg_pnl)
+        _record_trade(sym, pos, outcome, exit_price, pos["qty"], leg_pnl, total_pnl=trade_total)
         if trade_total > 0: _CONSECUTIVE_LOSSES = 0
         else:
             _CONSECUTIVE_LOSSES += 1
@@ -879,7 +1045,7 @@ def _close_and_record(dhan, sym, pos, outcome, exit_price, filled_leg_id=None):
     emoji = {"TARGET": "🎉", "SL": "🛑", "EOD_FORCED": "⏰",
              "TIME_PROFIT": "⌛", "TIME_STALE": "💤", "PEAK_EXIT": "🔒"}.get(outcome, "✅")
     tg_send(f"{emoji} {outcome} {sym} @ ₹{round(exit_price,2)} [{pos.get('strategy','?')}] "
-            f"P&L: ₹{leg_pnl:+,.2f}", silent=True)
+            f"P&L: ₹{leg_pnl:+,.2f} (Total: ₹{trade_total:+,.2f})", silent=True)
     _evaluate_halt()
 
 def monitor_oco(dhan):
@@ -896,6 +1062,15 @@ def monitor_oco(dhan):
         if force_exit:
             _close_and_record(dhan, sym, pos, "EOD_FORCED", ltp or pos["entry"]); continue
         if bar is None: continue
+        # Ignore stale completed 5m bars from before the position was opened
+        bar_ts = bar.get("ts")
+        opened_at = pos.get("opened_at")
+        if bar_ts is not None and opened_at is not None:
+            try:
+                if bar_ts < opened_at - timedelta(minutes=CANDLE_INTERVAL_MIN):
+                    continue
+            except Exception:
+                pass
         _update_peak(pos, bar["high"], bar["low"])
         reason = _time_based_exit(pos, bar["close"], now)
         if reason:
@@ -998,10 +1173,10 @@ PARTIAL_EXIT_FRACTION = 0.5
 def _pnl_totals():
     with _POS_LOCK: trades = list(_COMPLETED_TRADES)
     finals = [t for t in trades if t["outcome"] != "PARTIAL"]
-    wins = [t for t in trades if t["pnl"] > 0]
-    losses = [t for t in trades if t["pnl"] <= 0]
+    wins = [t for t in finals if t.get("total_pnl", t["pnl"]) > 0]
+    losses = [t for t in finals if t.get("total_pnl", t["pnl"]) <= 0]
     net = sum(t["pnl"] for t in trades)
-    wr = (len([t for t in finals if t["pnl"] > 0]) / len(finals) * 100) if finals else 0.0
+    wr = (len(wins) / len(finals) * 100) if finals else 0.0
     return {"trades": trades, "finals": finals, "wins": wins, "losses": losses,
             "net": net, "win_rate": wr}
 
@@ -1061,6 +1236,22 @@ def scan_once(dhan, universe):
     signals = []
     log.info(f"Scan @ {datetime.now(IST).strftime('%H:%M:%S')} on {len(universe)} stocks")
     rows = list(universe.itertuples(index=False))
+    is_free_feed = bool(getattr(dhan, "is_free_provider", False) or getattr(dhan, "_dhan_data_failed", False))
+    eff_sleep = 0.0 if is_free_feed else REQUEST_SLEEP_SEC
+
+    def _process_row_df(row, df):
+        if df is None:
+            return
+        hits = detect_patterns(df)
+        if hits:
+            signals.extend(score_signals(row.symbol, row.security_id, df, hits))
+        if "_msl" in globals() and getattr(_msl, "PDHL_BREAK_ENABLED", True):
+            try:
+                ps = _msl.score_pdhl_break(row.symbol, row.security_id, df)
+                if ps:
+                    signals.extend(ps)
+            except Exception:
+                pass
 
     if SCAN_WORKERS > 1:
         # Parallelise ONLY the network fetch; detection+scoring stay sequential
@@ -1071,22 +1262,19 @@ def scan_once(dhan, universe):
                 if not (MARKET_OPEN <= datetime.now(IST).time() <= MARKET_CLOSE):
                     break
                 fetched.append((row, df))
-                time.sleep(REQUEST_SLEEP_SEC)
+                if eff_sleep > 0:
+                    time.sleep(eff_sleep)
                 if (i + 1) % 25 == 0:
                     log.info(f"  fetched {i + 1}/{len(rows)}")
         for row, df in fetched:
-            if df is not None:
-                hits = detect_patterns(df)
-                if hits:
-                    signals.extend(score_signals(row.symbol, row.security_id, df, hits))
+            _process_row_df(row, df)
     else:
         for i, row in enumerate(rows):
             if not (MARKET_OPEN <= datetime.now(IST).time() <= MARKET_CLOSE): break
             df = fetch_intraday(dhan, row.security_id)
-            if df is not None:
-                hits = detect_patterns(df)
-                if hits: signals.extend(score_signals(row.symbol, row.security_id, df, hits))
-            time.sleep(REQUEST_SLEEP_SEC)
+            _process_row_df(row, df)
+            if eff_sleep > 0:
+                time.sleep(eff_sleep)
             if (i + 1) % 25 == 0: log.info(f"  processed {i + 1}/{len(rows)}")
     if not signals: return pd.DataFrame()
     return (pd.DataFrame(signals).sort_values(["score", "vol_ratio"], ascending=[False, False])
@@ -1101,20 +1289,34 @@ def act_on_signals(dhan, ranked):
         if not passes_nifty_gate(direction, ntrend): continue
         sigd = sig.to_dict(); strat = sigd.get("strategy", "?")
         # Kronos gate
-        if _KRONOS_OK:
+        if _KRONOS_OK and kronos_gate is not None:
             try:
                 allow, adj, kreason = kronos_gate.kronos_check(sigd["symbol"], direction)
                 sigd["kronos"] = kreason
-                if not allow: continue
+                if not allow:
+                    if _AUDIT_OK and decision_audit is not None:
+                        try:
+                            decision_audit.signal_rejected(
+                                symbol=sigd["symbol"], strategy=strat, reasons=[f"kronos:{kreason}"]
+                            )
+                        except Exception:
+                            pass
+                    continue
                 sigd["score"] = int(sigd.get("score", 0)) + adj
             except Exception: pass
         record_suggestion(sigd)
         _emit("signal_found", sigd, "scanner")
         if sigd["score"] >= MIN_SCORE_TO_TRADE and (SCAN_START <= datetime.now(IST).time() <= NO_ENTRY_AFTER):
-            with _POS_LOCK: block = _entry_blocked(sigd["symbol"], sigd.get("strategy"))
+            with _POS_LOCK:
+                block = _entry_blocked(sigd["symbol"], strat if AUTO_TRADE_ENABLED else None)
             if block:
                 if "not-proven" in block:
                     log.info(f"[{sigd['symbol']}] {block}")
+                if _AUDIT_OK and decision_audit is not None:
+                    try:
+                        decision_audit.signal_rejected(symbol=sigd["symbol"], strategy=strat, reasons=[block])
+                    except Exception:
+                        pass
                 continue
             place_bracket_orders(dhan, sigd)
 

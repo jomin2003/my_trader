@@ -192,24 +192,54 @@ def _config_age_days(cfg: dict):
         return None
 
 
+_BASELINE_ATTRS: dict[str, dict[str, object]] = {}
+_LAST_APPLIED_PROMOTED_AT: dict[str, str] = {}
+ALLOWED_FLAGS = {"NIFTY_GATE_ENABLED", "NIFTY_STRICT"}
+
+
+def _ensure_baseline(mod, module_name: str):
+    if module_name not in _BASELINE_ATTRS:
+        snap = {}
+        for k in list(OVERRIDABLE_ATTRS.keys()) + list(ALLOWED_FLAGS):
+            if hasattr(mod, k):
+                snap[k] = getattr(mod, k)
+        _BASELINE_ATTRS[module_name] = snap
+
+
+def _restore_baseline(mod, module_name: str):
+    snap = _BASELINE_ATTRS.get(module_name, {})
+    for k, v in snap.items():
+        setattr(mod, k, v)
+
+
 def apply_live_config(module_name: str = "intraday_pattern_scanner_v2",
                       config_path=None, tg_sender=None):
     path = Path(config_path) if config_path else DEFAULT_CONFIG_PATH
+    if module_name in sys.modules:
+        _ensure_baseline(sys.modules[module_name], module_name)
+
     if not path.exists():
+        if module_name in sys.modules:
+            _restore_baseline(sys.modules[module_name], module_name)
         log.info(f"No {path.name} found. Using hardcoded scanner defaults.")
         return None
 
     try:
         cfg = json.loads(path.read_text())
     except Exception as e:
+        if module_name in sys.modules:
+            _restore_baseline(sys.modules[module_name], module_name)
         log.error(f"Could not parse {path}: {e}. Ignoring.")
         if tg_sender:
             tg_sender(f"⚠️ live_config.json unreadable: {e}. Using defaults.")
         return None
 
     age = _config_age_days(cfg)
-    if age is not None and age > MAX_AGE_DAYS:
-        msg = (f"live_config.json is {age:.0f} days old (>{MAX_AGE_DAYS}). "
+    max_age = _max_age_days()
+    if age is not None and age > max_age:
+        if module_name in sys.modules:
+            _restore_baseline(sys.modules[module_name], module_name)
+        msg = (f"live_config.json is {age:.0f} days old (>{max_age}). "
                f"Rejecting; using hardcoded defaults.")
         log.warning(msg)
         if tg_sender:
@@ -223,15 +253,20 @@ def apply_live_config(module_name: str = "intraday_pattern_scanner_v2",
             log.error(f"Cannot import {module_name}: {e}")
             return None
     mod = sys.modules[module_name]
+    _ensure_baseline(mod, module_name)
+    _restore_baseline(mod, module_name)
 
     applied = {}
     skipped = []
     params = cfg.get("params", {})
     for name, raw_val in params.items():
+        if name not in OVERRIDABLE_ATTRS and name not in ALLOWED_FLAGS:
+            skipped.append(name)
+            continue
         if not hasattr(mod, name):
             skipped.append(name)
             continue
-        val = _cast_value(name, raw_val) if name in OVERRIDABLE_ATTRS else raw_val
+        val = _cast_value(name, raw_val) if name in OVERRIDABLE_ATTRS else bool(raw_val)
         old = getattr(mod, name)
         setattr(mod, name, val)
         applied[name] = {"old": old, "new": val}
@@ -246,9 +281,11 @@ def apply_live_config(module_name: str = "intraday_pattern_scanner_v2",
     for k, v in applied.items():
         log.info(f"  {k}: {v['old']} -> {v['new']}")
     if skipped:
-        log.debug(f"Skipped (attr not in scanner): {skipped}")
+        log.debug(f"Skipped (attr not in allowlist/scanner): {skipped}")
 
-    if tg_sender:
+    promoted_at = str(cfg.get("meta", {}).get("promoted_at", ""))
+    if tg_sender and _LAST_APPLIED_PROMOTED_AT.get(module_name) != promoted_at:
+        _LAST_APPLIED_PROMOTED_AT[module_name] = promoted_at
         summary = ", ".join(f"{k}={v['new']}" for k, v in list(applied.items())[:5])
         tg_sender(
             f"✅ Live config applied "

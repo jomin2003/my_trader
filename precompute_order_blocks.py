@@ -55,10 +55,12 @@ def find_order_blocks(df15, symbol):
         prior10 = df15.iloc[max(0, i-LOOKBACK_HIGH):i]
         if len(prior10) < 3 or len(next3) < 3: continue
         move_up = next3["close"].max() - bar["close"]
+        conf_time = df15.iloc[i+3]["ts"].strftime("%H:%M")
         if (move_up > BREAK_ATR_MULT * atr[i]) and (next3["high"].max() > prior10["high"].max()):
             if bar["close"] < bar["open"]:
                 obs.append({"symbol":symbol,"date":bar["date"].isoformat(),"ob_type":"BULL",
                     "ob_time":bar["ts"].strftime("%H:%M"),
+                    "confirmed_time":conf_time,
                     "ob_body_high":round(max(bar["open"],bar["close"]),4),
                     "ob_body_low":round(min(bar["open"],bar["close"]),4),
                     "ob_high":round(bar["high"],4),"ob_low":round(bar["low"],4)})
@@ -68,6 +70,7 @@ def find_order_blocks(df15, symbol):
             if bar["close"] > bar["open"]:
                 obs.append({"symbol":symbol,"date":bar["date"].isoformat(),"ob_type":"BEAR",
                     "ob_time":bar["ts"].strftime("%H:%M"),
+                    "confirmed_time":conf_time,
                     "ob_body_high":round(max(bar["open"],bar["close"]),4),
                     "ob_body_low":round(min(bar["open"],bar["close"]),4),
                     "ob_high":round(bar["high"],4),"ob_low":round(bar["low"],4)})

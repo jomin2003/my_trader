@@ -90,6 +90,7 @@ def _load_one(path: str) -> Optional[pd.DataFrame]:
                    if k in c), None)
     if ts_col is not None:
         ts = pd.to_datetime(df[ts_col], errors="coerce", utc=True)
+        out["_ts_sort"] = ts
         out.index = ts
         out = out.dropna(axis=0, how="any")
         # if there are multiple rows per calendar day, it's intraday -> resample
@@ -98,6 +99,7 @@ def _load_one(path: str) -> Optional[pd.DataFrame]:
                 "open": "first", "high": "max", "low": "min",
                 "close": "last", "volume": "sum",
             }).dropna(how="any")
+            out["_ts_sort"] = out.index
         # REAL calendar weekday (0=Mon..4=Fri). The old code used row-index%5,
         # which silently desyncs on every market holiday -> a noise feature.
         try:
@@ -105,6 +107,7 @@ def _load_one(path: str) -> Optional[pd.DataFrame]:
         except Exception:
             out["dow"] = 0.0
     else:
+        out["_ts_sort"] = pd.RangeIndex(len(out))
         out["dow"] = 0.0   # no timestamps available -> neutral constant
     out = out.reset_index(drop=True)
     return out if len(out) >= MIN_ROWS_PER_SYMBOL else None
@@ -180,6 +183,8 @@ def build_dataset(csv_dir: str) -> Tuple[pd.DataFrame, Dict[str, pd.DataFrame]]:
     if not rows:
         raise ValueError("no symbol had enough clean data")
     pooled = pd.concat(rows, ignore_index=True)
+    if "_ts_sort" in pooled.columns:
+        pooled = pooled.sort_values("_ts_sort").reset_index(drop=True)
     print(f"[vol] {len(per_symbol)} symbols, {len(pooled)} pooled rows")
     return pooled, per_symbol
 

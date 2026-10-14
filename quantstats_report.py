@@ -148,8 +148,11 @@ def _cohort_split(df: pd.DataFrame, col: str):
     if col not in df.columns:
         log.warning(f"column '{col}' not in trades — skipping split")
         return
-    s = df[col].astype(str).str.lower()
-    is_set = (df[col].astype(str).str.len() > 0) & (~s.isin(["na", "nan", "none", ""]))
+    s = df[col].fillna("").astype(str).str.strip().str.lower()
+    if col == "kronos":
+        is_set = s.str.startswith("agree")
+    else:
+        is_set = (s.str.len() > 0) & (~s.isin(["na", "nan", "none", ""]))
     has = df[is_set]
     non = df[~is_set]
     yield f"{col}=SET ({len(has)})", has

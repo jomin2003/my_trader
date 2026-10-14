@@ -264,6 +264,15 @@ def _load_side_block():
 _load_side_block()
 
 
+def _add_45m(hm: str) -> str:
+    try:
+        h, m = (int(x) for x in str(hm).split(":"))
+        total = h * 60 + m + 45
+        return f"{total // 60:02d}:{total % 60:02d}"
+    except Exception:
+        return str(hm)
+
+
 def _load_ob():
     global _OB_LOADED
     if _OB_LOADED: return
@@ -272,8 +281,12 @@ def _load_ob():
         try:
             df = pd.read_csv(p); df["date"] = pd.to_datetime(df["date"]).dt.date
             for r in df.itertuples(index=False):
+                conf_t = getattr(r, "confirmed_time", None)
+                if not conf_t or pd.isna(conf_t):
+                    conf_t = _add_45m(r.ob_time)
                 _OB.setdefault((r.symbol.upper(), r.date), []).append(
                     {"type": r.ob_type, "time": r.ob_time,
+                     "confirmed_time": str(conf_t),
                      "hi": float(r.ob_body_high), "lo": float(r.ob_body_low)})
             log.info(f"OB zones: {sum(len(v) for v in _OB.values())}")
         except Exception as e:
@@ -617,9 +630,10 @@ def score_signals(symbol, security_id, df, hits):
             matched = None
             for ob in _get_ob(symbol, today):
                 if ob["type"] != "BEAR": continue
-                # today's zone must already have formed by now; past-day zones are
+                # today's zone must already have formed & confirmed by now; past-day zones are
                 # confirmed by construction (marked "_past_day" by the fallback)
-                if "_past_day" not in ob and ob["time"] >= now_t: continue
+                eff_time = ob.get("confirmed_time") or ob["time"]
+                if "_past_day" not in ob and eff_time >= now_t: continue
                 if high_now >= ob["lo"] and high_now <= ob["hi"] + 0.5*atr_val:
                     matched = ob; break
             if matched is None: continue

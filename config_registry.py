@@ -38,15 +38,17 @@ log = logging.getLogger("config")
 
 @dataclass(frozen=True)
 class _Defaults:
-    # ---- DHAN ----
+    # ---- DHAN & MARKET DATA ----
     DHAN_CLIENT_ID: str = ""
     DHAN_ACCESS_TOKEN: str = ""
     DHAN_PIN: str = ""
     DHAN_TOTP_SECRET: str = ""
+    MARKET_DATA_PROVIDER: str = "auto"
 
     # ---- TELEGRAM ----
     TG_BOT_TOKEN: str = ""
     TG_CHAT_ID: str = ""
+    TG_WEBHOOK_SECRET: str = ""
 
     # ---- GITHUB ----
     GITHUB_TOKEN: str = ""
@@ -116,7 +118,8 @@ class _Defaults:
     # Parallel fetch workers for scan_once. 1 = sequential (legacy behavior).
     # >1 parallelises only the network fetch phase; pattern detection and
     # scoring stay sequential (score_signals uses a module-global scratch df).
-    SCAN_WORKERS: int = 1
+    SCAN_WORKERS: int = 8
+    FREE_DATA_CACHE_TTL_SEC: float = 45.0
 
     # ---- TIME ----
     MARKET_OPEN_HOUR: int = 9
@@ -352,7 +355,7 @@ class ConfigRegistry:
         safe: dict[str, Any] = {}
         secret_keys = {
             "DHAN_CLIENT_ID", "DHAN_ACCESS_TOKEN", "DHAN_PIN", "DHAN_TOTP_SECRET",
-            "TG_BOT_TOKEN", "TG_CHAT_ID", "CRON_SECRET", "GITHUB_TOKEN",
+            "TG_BOT_TOKEN", "TG_CHAT_ID", "TG_WEBHOOK_SECRET", "CRON_SECRET", "GITHUB_TOKEN",
             "GITHUB_GIST_ID", "LEDGER_GIST_ID", "STATE_GIST_ID",
             "KRONOS_GIST_ID", "VOL_GIST_ID", "GIST_TOKEN",
         }
@@ -437,13 +440,15 @@ def version() -> str:
 
 def ensure_env() -> list[str]:
     """
-    Check which required env vars are missing.  Returns list of missing keys.
-    Call at boot — if non-empty, the bot should refuse to start or use defaults.
+    Check which required env vars are missing. Returns list of missing keys.
+    When MARKET_DATA_PROVIDER is 'free' or 'auto' in paper mode (AUTO_TRADE_ENABLED=false),
+    DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN are optional because FreeMarketDataClient is used.
     """
-    required = [
-        "DHAN_CLIENT_ID", "DHAN_ACCESS_TOKEN",
-        "TG_BOT_TOKEN", "TG_CHAT_ID", "GITHUB_TOKEN", "GITHUB_GIST_ID",
-    ]
+    auto_trade = os.getenv("AUTO_TRADE_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
+    provider = os.getenv("MARKET_DATA_PROVIDER", "auto").strip().lower()
+    required = ["TG_BOT_TOKEN", "TG_CHAT_ID", "GITHUB_TOKEN", "GITHUB_GIST_ID"]
+    if auto_trade or provider == "dhan":
+        required = ["DHAN_CLIENT_ID", "DHAN_ACCESS_TOKEN"] + required
     missing = [k for k in required if not os.getenv(k)]
     return missing
 

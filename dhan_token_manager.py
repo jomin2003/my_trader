@@ -201,23 +201,35 @@ def _renew_existing(current: TokenState):
     return st
 
 
+def _publish_token(st: TokenState) -> None:
+    os.environ["DHAN_ACCESS_TOKEN"] = st.access_token
+    if st.client_id and not os.getenv("DHAN_CLIENT_ID"):
+        os.environ["DHAN_CLIENT_ID"] = st.client_id
+    try:
+        import config_registry as cfg
+        cfg._config.set("DHAN_ACCESS_TOKEN", st.access_token) if cfg._config else None
+    except Exception:
+        pass
+
+
 def refresh(force: bool = False, prefer_renew: bool = True) -> TokenState:
     if not force:
         cached = load_token()
         if cached and cached.is_valid() and cached.hours_left > REFRESH_IF_LESS_THAN_HOURS:
             log.info(f"Cached token valid ({cached.hours_left:.1f}h left). Skipping refresh.")
+            _publish_token(cached)
             return cached
 
         if prefer_renew and cached and cached.is_valid():
             renewed = _renew_existing(cached)
             if renewed:
                 save_token(renewed)
-                os.environ["DHAN_ACCESS_TOKEN"] = renewed.access_token
+                _publish_token(renewed)
                 return renewed
 
     fresh = _generate_via_totp()
     save_token(fresh)
-    os.environ["DHAN_ACCESS_TOKEN"] = fresh.access_token
+    _publish_token(fresh)
     return fresh
 
 

@@ -52,6 +52,9 @@ def main():
     res = bh.backtest(bars, top_per_bar=20, nifty_trend_map=trend,
                       nifty_strict=args.strict, nifty_gate_enabled=True)
     s = bh.summarize(res, bh.INITIAL_CAPITAL)
+    if s.get("trades", 0) == 0:
+        print(f"  NO TRADES in slice {start}..{end}")
+        return
 
     print(f"  trades={s['trades']} wr={s['win_rate']:.1f}% pf={s['profit_factor']:.2f} "
           f"expR={s['expectancy_R']:.3f} net=Rs{s['total_pnl']:.0f} dd={s['max_drawdown_pct']:.1f}%")

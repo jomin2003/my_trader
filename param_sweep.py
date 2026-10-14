@@ -463,7 +463,9 @@ def walk_forward(bars: dict, nifty_df, grid: dict, train_ratio: float):
         te_row = run_one(te_bars, trend_te, trend_te, dict(params))
         te_row["_train_fitness"] = top_row["fitness"]
         test_rows.append(te_row)
-    te_df = pd.DataFrame(test_rows).sort_values("fitness", ascending=False)
+    te_df = pd.DataFrame(test_rows)
+    if not te_df.empty and "fitness" in te_df.columns:
+        te_df = te_df.sort_values("fitness", ascending=False).reset_index(drop=True)
     return tr_df, te_df
 
 

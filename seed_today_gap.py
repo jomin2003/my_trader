@@ -53,11 +53,15 @@ def _bars_to_df(data):
 
 def seed_today(dhan, universe, gap_csv_path: str | None = None) -> int:
     """Seed today's gap rows + PDHL levels. Returns the number of gap rows written."""
+    from zoneinfo import ZoneInfo
     from intraday_pattern_scanner_v2 import CANDLE_INTERVAL_MIN
 
     out_path = Path(gap_csv_path) if gap_csv_path else _gap_path()
-    today = datetime.now().astimezone().date()
+    today = datetime.now(ZoneInfo("Asia/Kolkata")).date()
     yday = _prev_trading_day(today)
+    from_day = yday - timedelta(days=4)  # handle long weekends / holidays
+    is_free_feed = bool(getattr(dhan, "is_free_provider", False))
+    eff_sleep = 0.0 if is_free_feed else (cfgm.get("REQUEST_SLEEP_SEC") or 0.22)
 
     # daily_atr per symbol from the most recent historical row
     atr_map: dict[str, float] = {}
@@ -79,7 +83,7 @@ def seed_today(dhan, universe, gap_csv_path: str | None = None) -> int:
         try:
             resp = dhan.intraday_minute_data(
                 security_id=sid, exchange_segment="NSE_EQ", instrument_type="EQUITY",
-                from_date=yday.isoformat(), to_date=today.isoformat(),
+                from_date=from_day.isoformat(), to_date=today.isoformat(),
                 interval=CANDLE_INTERVAL_MIN)
             data = resp.get("data") if isinstance(resp, dict) else None
             if not data or not data.get("open"):
@@ -88,10 +92,12 @@ def seed_today(dhan, universe, gap_csv_path: str | None = None) -> int:
             if df is None or df.empty:
                 continue
             df["d"] = df["ts"].dt.date
-            prev_bars = df[df["d"] < today]
+            prev_all = df[df["d"] < today]
             today_bars = df[df["d"] == today].sort_values("ts")
-            if prev_bars.empty or today_bars.empty:
+            if prev_all.empty or today_bars.empty:
                 continue
+            last_prev_date = prev_all["d"].max()
+            prev_bars = prev_all[prev_all["d"] == last_prev_date].sort_values("ts")
             prev_close = float(prev_bars["close"].iloc[-1])
             prev_high = float(prev_bars["high"].max())
             prev_low = float(prev_bars["low"].min())
@@ -100,7 +106,8 @@ def seed_today(dhan, universe, gap_csv_path: str | None = None) -> int:
                 continue
             atr = atr_map.get(sym)
             if not atr or atr <= 0:
-                continue
+                # Fallback ATR on cold start when gap_data.csv has no prior row for sym
+                atr = max(prev_high - prev_low, round(prev_close * 0.015, 3))
             # PDHL levels: previous day's extremes are today's breakout levels.
             # atr is the daily-scale ATR carried from the gap table (informational —
             # live exits use the scanner's own 5-min ATR).
@@ -123,7 +130,8 @@ def seed_today(dhan, universe, gap_csv_path: str | None = None) -> int:
             })
         except Exception as e:
             log.warning(f"seed_gap skip {sym}: {e}")
-        time.sleep(cfgm.get("REQUEST_SLEEP_SEC") or 0.22)
+        if eff_sleep > 0:
+            time.sleep(eff_sleep)
 
     _write_rows(gap_csv_path or str(_gap_path()), new_rows, today)
     _write_rows(str(_pdhl_path()), pdhl_rows, today)

@@ -96,13 +96,13 @@ def run(bars, nifty, trend, label, overrides, bt_kwargs=None):
     msl._TRADED.clear()
     vws.clear()
     msl.reload_tables()
+    if isinstance(overrides, tuple):
+        overrides, bt_kwargs = overrides
     saved = []
     try:
         for mod, attr, val in overrides:
             saved.append((mod, attr, getattr(mod, attr)))
             setattr(mod, attr, val)
-        if isinstance(overrides, tuple):
-            overrides, bt_kwargs = overrides
         bt = {"nifty_strict": False, "nifty_gate_enabled": True}
         bt.update(bt_kwargs or {})
         res = bh.backtest(bars, top_per_bar=20, nifty_trend_map=trend, **bt)
@@ -139,8 +139,11 @@ def main():
     bars_all = {k: bars_all[k] for k in names}
     nifty = bh._read_bar_csv(csv_dir / "NIFTY.csv")
     if args.start:
-        bars_all = ps.filter_bars_by_dates(bars_all, pd.Timestamp(args.start).date(), pd.Timestamp(args.end).date())
-        nifty = ps.filter_nifty_by_dates(nifty, pd.Timestamp(args.start).date(), pd.Timestamp(args.end).date())
+        start_d = pd.Timestamp(args.start).date()
+        end_d = pd.Timestamp(args.end).date() if args.end else pd.Timestamp.now().date()
+        keep = {d for df in bars_all.values() for d in (ts.date() for ts in df["ts"]) if start_d <= d <= end_d}
+        bars_all = ps.filter_bars_by_dates(bars_all, keep)
+        nifty = ps.filter_nifty_by_dates(nifty, keep)
     trend = bh.build_nifty_trend(nifty, strict=False)
     print(f"symbols={len(bars_all)} {names[:5]}...")
 

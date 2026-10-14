@@ -204,6 +204,7 @@ def restore_state(scn, app_state: dict | None = None) -> dict:
             scn._TRADING_HALTED_TODAY = bool(snap.get("halted_today", False))
             scn._HALT_REASON = snap.get("halt_reason", "")
             scn._CONSECUTIVE_LOSSES = int(snap.get("consecutive_losses", 0))
+            scn._LAST_RESTORE_DATE = datetime.now(IST).date()
             cd = snap.get("symbol_cooldown", {})
             scn._SYMBOL_COOLDOWN.clear()
             for k, v in cd.items():

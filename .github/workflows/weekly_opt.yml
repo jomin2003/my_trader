@@ -56,13 +56,50 @@ jobs:
             --walk-forward 0.7 \
             --out ./sweep_out
 
-      - name: Run backtest for Monte Carlo input
+      - name: Run backtest on top OOS config for Monte Carlo input
         run: |
-          python backtest_harness.py \
-            --mode csv \
-            --csv-dir ./data \
-            --nifty-csv ./data/NIFTY.csv \
-            --out ./backtest_out
+          python - << 'PY'
+          from pathlib import Path
+          import pandas as pd
+          from dataclasses import asdict
+          import intraday_pattern_scanner_v2 as scn
+          import backtest_harness as bh
+          import param_sweep as ps
+
+          te_files = sorted(Path("./sweep_out").glob("sweep_test_*.csv"))
+          tr_files = sorted(Path("./sweep_out").glob("sweep_*.csv"))
+          cand = te_files[-1] if te_files else (tr_files[-1] if tr_files else None)
+          overrides = {}
+          gate_mode = "soft"
+          top_per_bar = 30
+          if cand and cand.exists():
+              df = pd.read_csv(cand)
+              if not df.empty:
+                  row = df.iloc[0]
+                  for k in ps._SCANNER_ATTRS:
+                      if k in row and pd.notna(row[k]):
+                          overrides[k] = bool(row[k]) if k == "REQUIRE_CONFIRMATION" else float(row[k]) if "." in str(row[k]) else int(row[k])
+                  if "nifty_gate" in row and pd.notna(row["nifty_gate"]):
+                      gate_mode = str(row["nifty_gate"])
+                  if "top_per_bar" in row and pd.notna(row["top_per_bar"]):
+                      top_per_bar = int(row["top_per_bar"])
+
+          bars = bh.load_csv_bars(Path("./data"), skip_names={"NIFTY", "NIFTY50", "NIFTY_50"})
+          nifty_df = bh._read_bar_csv(Path("./data/NIFTY.csv")) if Path("./data/NIFTY.csv").exists() else None
+          trend_map = bh.build_nifty_trend(nifty_df) if nifty_df is not None else {}
+          gate_on = gate_mode in ("soft", "strict") and bool(trend_map)
+          strict = gate_mode == "strict"
+
+          with ps.ScannerConfig(**overrides):
+              res = bh.backtest(bars, top_per_bar=top_per_bar, nifty_trend_map=trend_map,
+                                nifty_strict=strict, nifty_gate_enabled=gate_on)
+
+          out_dir = Path("./backtest_out")
+          out_dir.mkdir(parents=True, exist_ok=True)
+          pd.DataFrame([asdict(t) for t in res.trades]).to_csv(out_dir / "trades_best.csv", index=False)
+          pd.DataFrame(res.equity_curve, columns=["ts", "equity"]).to_csv(out_dir / "equity_best.csv", index=False)
+          print(f"Saved {len(res.trades)} trades for top config: {overrides} (gate={gate_mode})")
+          PY
 
       - name: Run Monte Carlo permutation test
         id: mc
@@ -78,8 +115,14 @@ jobs:
             --out ./mc_out \
             2>&1 | tee mc_output.log
 
-          # Extract p-value for expectancy_R and expose to next step
-          P_VALUE=$(grep -E "^\s*expectancy_R:" mc_output.log | head -n 1 | awk '{print $2}')
+          # Extract p-value for expectancy_R from permutation section and expose to next step
+          P_VALUE=$(python -c '
+          import re, pathlib
+          txt = pathlib.Path("mc_output.log").read_text(errors="ignore")
+          sec = txt.split("p-values")[-1] if "p-values" in txt else txt
+          m = re.search(r"expectancy_R:\s*([0-9.]+)", sec)
+          print(m.group(1) if m else "1.0")
+          ')
           echo "p_value=$P_VALUE" >> $GITHUB_OUTPUT
           echo "Extracted p-value: $P_VALUE"
 
@@ -95,10 +138,15 @@ jobs:
           PASSED=$(python -c "print('yes' if float('$P_VALUE') < 0.05 else 'no')")
           if [ "$PASSED" = "yes" ]; then
             echo "✅ MC passed — promoting new config"
-            LATEST_SWEEP=$(ls -t ./sweep_out/sweep_*.csv | head -n 1)
-            python live_config.py promote --sweep "$LATEST_SWEEP" --force
-            python gist_storage.py backup live_config.json
-            echo "PROMOTED=true" >> $GITHUB_ENV
+            LATEST_SWEEP=$(ls -t ./sweep_out/sweep_test_*.csv ./sweep_out/sweep_*.csv 2>/dev/null | head -n 1)
+            python live_config.py promote --sweep "$LATEST_SWEEP"
+            if [ -f live_config.json ]; then
+              python gist_storage.py backup live_config.json
+              echo "PROMOTED=true" >> $GITHUB_ENV
+            else
+              echo "ℹ️ Sweep winner failed live_config safety gates — keeping current config"
+              echo "PROMOTED=false" >> $GITHUB_ENV
+            fi
           else
             echo "ℹ️ MC did not pass (p=$P_VALUE >= 0.05) — keeping current config"
             echo "PROMOTED=false" >> $GITHUB_ENV

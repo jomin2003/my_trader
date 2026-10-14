@@ -309,12 +309,9 @@ def backtest(symbol_bars: dict[str, pd.DataFrame],
             if len(hist) < scn.MIN_CANDLES_NEEDED:
                 continue
             hits = scn.detect_patterns(hist)
-            if not hits:
-                continue
-            hits = _confirmation_ok(hits, hist)
-            if not hits:
-                continue
-            sigs.extend(scn.score_signals(sym, sym, hist, hits))
+            if hits:
+                hits = _confirmation_ok(hits, hist)
+            sigs.extend(scn.score_signals(sym, sym, hist, hits or []))
 
         if not sigs:
             result.equity_curve.append((bar_ts, equity))
@@ -366,11 +363,25 @@ def backtest(symbol_bars: dict[str, pd.DataFrame],
 
             entry_px = float(nxt["open"])
             direction = 1 if sig["signal"] == "BUY" else -1
-            # PATCHED: pass the strategy so exits match the LIVE per-strategy
-            # profiles (strategy_exits). Previously fell back to globals, so
-            # the harness tested RR=2.0 while live trades RR=1.5.
-            sl, tgt, sl_dist = scn.compute_sl_target(
-                entry_px, direction, sig.get("atr"), strategy=sig.get("strategy"))
+            # Use structural / pattern-native SL & target when present and valid,
+            # matching live act_on_signals() behavior; otherwise fall back to
+            # per-strategy ATR profile.
+            struct_sl = sig.get("struct_sl")
+            struct_tgt = sig.get("struct_target")
+            if (struct_sl is not None and struct_tgt is not None
+                    and pd.notna(struct_sl) and pd.notna(struct_tgt)
+                    and float(struct_sl) > 0 and float(struct_tgt) > 0
+                    and abs(entry_px - float(struct_sl)) > 0):
+                sl = round(float(struct_sl), 2)
+                tgt = round(float(struct_tgt), 2)
+                sl_dist = abs(entry_px - sl)
+                valid_side = (sl < entry_px < tgt) if direction > 0 else (tgt < entry_px < sl)
+                if not valid_side:
+                    sl, tgt, sl_dist = scn.compute_sl_target(
+                        entry_px, direction, sig.get("atr"), strategy=sig.get("strategy"))
+            else:
+                sl, tgt, sl_dist = scn.compute_sl_target(
+                    entry_px, direction, sig.get("atr"), strategy=sig.get("strategy"))
             qty = scn.compute_quantity(entry_px, sl_dist)
             if qty <= 0:
                 continue
@@ -429,8 +440,10 @@ def summarize(res: BacktestResult, initial_capital=INITIAL_CAPITAL) -> dict:
         eq["dd"] = (eq["equity"].cummax() - eq["equity"]) / eq["equity"].cummax()
         max_dd = eq["dd"].max()
         eq["date"] = pd.to_datetime(eq["ts"]).dt.date
-        daily = eq.groupby("date")["equity"].last().pct_change().dropna()
-        sharpe = (daily.mean()/daily.std()*(252**0.5)) if daily.std() > 0 else 0.0
+        daily_eq = eq.groupby("date")["equity"].last()
+        prev_eq = daily_eq.shift(1).fillna(initial_capital)
+        daily = (daily_eq - prev_eq) / prev_eq
+        sharpe = (daily.mean()/daily.std()*(252**0.5)) if len(daily) > 1 and daily.std() > 0 else 0.0
     else:
         max_dd, sharpe = 0.0, 0.0
     return {

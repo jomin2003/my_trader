@@ -26,20 +26,27 @@ def canon(p: str) -> str:
     if "ORB" in p: return "ORB"
     if "GapFill" in p: return "GAPFILL"
     if "GapGo" in p: return "GAPGO"
-    if "OB Bear" in p: return "OB_SHORTS"
+    if "OB Bear" in p: return "OB_SHORT"
     if "VWAP Reclaim" in p: return "VWAP_RECLAIM"
     if "VWAP Pullback" in p: return "VWAP_PULLBACK"
     if "Super" in p: return "SUPERTREND"
+    if "VwapFade" in p or "MR_VWAP" in p: return "MR_VWAP_FADE"
+    if "Pdhl" in p or "PDHL" in p: return "PDHL_BREAK"
+    if "Flag" in p: return "CP_FLAG"
+    if "Triangle" in p: return "CP_TRIANGLE"
+    if "Double" in p: return "CP_DOUBLE"
+    if "ABCD" in p: return "CP_ABCD"
     return "CANDLE_STRUCT"
 
 def evaluate(csv_dir: Path, min_trades: int):
     msl.reload_tables()
-    bars = load_csv_bars(csv_dir, skip_names={"NIFTY"})
-    nifty = _read_bar_csv(csv_dir/"NIFTY.csv")
-    trend = build_nifty_trend(nifty)
+    bars = load_csv_bars(csv_dir, skip_names={"NIFTY", "NIFTY50", "NIFTY_50"})
+    nifty_path = csv_dir / "NIFTY.csv"
+    nifty = _read_bar_csv(nifty_path) if nifty_path.exists() else None
+    trend = build_nifty_trend(nifty) if nifty is not None else {}
     scn.MIN_SCORE_TO_TRADE = 8; scn.ADX_MIN_THRESHOLD = 25; msl.ADX_MIN_THRESHOLD = 25
     scn.MAX_OPEN_POSITIONS = 3
-    res = backtest(bars, top_per_bar=30, nifty_trend_map=trend, nifty_gate_enabled=False)
+    res = backtest(bars, top_per_bar=30, nifty_trend_map=trend, nifty_gate_enabled=bool(trend))
     df = pd.DataFrame([t.__dict__ for t in res.trades]) if res.trades else pd.DataFrame()
     if df.empty:
         return {}, df

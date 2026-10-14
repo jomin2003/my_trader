@@ -178,14 +178,19 @@ def boot_restore():
         log.warning(f"Gist restore skipped: {e}")
     try:
         from dhan_token_manager import ensure_valid_token
-        tok = ensure_valid_token(force=False)
-        if tok:
-            reset_dhan()
-            STATE["last_token_refresh"] = now_ist().isoformat()
-            log.info("Dhan token ready")
+        has_dhan_creds = bool(os.getenv("DHAN_CLIENT_ID", "").strip() and (
+            os.getenv("DHAN_ACCESS_TOKEN", "").strip() or os.getenv("DHAN_TOTP_SECRET", "").strip()
+        ))
+        if has_dhan_creds:
+            tok = ensure_valid_token(force=False)
+            if tok:
+                reset_dhan()
+                STATE["last_token_refresh"] = now_ist().isoformat()
+                log.info("Dhan token ready")
+        else:
+            log.info("Dhan credentials not set — using FreeMarketDataClient (Yahoo Finance)")
     except Exception as e:
-        log.error(f"Token refresh on boot failed: {e}")
-        _record_error(f"boot token: {e}")
+        log.warning(f"Token refresh on boot skipped/failed ({e}) — FreeMarketDataClient active")
     # ---- crash/cold-start recovery: restore today's live state ----
     try:
         import intraday_pattern_scanner_v2 as scn
@@ -208,10 +213,18 @@ def get_dhan():
     global _DHAN
     with _DHAN_LOCK:
         if _DHAN is None:
-            from dhanhq import DhanContext, dhanhq
-            cid = os.getenv("DHAN_CLIENT_ID", "")
-            tok = os.getenv("DHAN_ACCESS_TOKEN", "")
-            _DHAN = dhanhq(DhanContext(cid, tok))
+            try:
+                from free_data_provider import build_market_client
+                _DHAN = build_market_client(
+                    client_id=os.getenv("DHAN_CLIENT_ID", ""),
+                    access_token=os.getenv("DHAN_ACCESS_TOKEN", ""),
+                )
+            except Exception as e:
+                log.warning(f"build_market_client fallback ({e}); initializing dhanhq")
+                from dhanhq import DhanContext, dhanhq
+                cid = os.getenv("DHAN_CLIENT_ID", "")
+                tok = os.getenv("DHAN_ACCESS_TOKEN", "")
+                _DHAN = dhanhq(DhanContext(cid, tok))
     return _DHAN
 
 def reset_dhan():
@@ -297,8 +310,10 @@ def _scan_worker():
         STATE["signals_today"] += signals_count
         if ranked is not None and not ranked.empty and SCAN_START <= t <= NO_ENTRY_AFTER:
             if not STATE["trading_halted"]:
+                opened_before = getattr(scn, "_POSITIONS_OPENED", 0)
                 scn.act_on_signals(dhan, ranked)
-                STATE["orders_today"] += int((ranked["score"] >= scn.MIN_SCORE_TO_TRADE).sum())
+                opened_after = getattr(scn, "_POSITIONS_OPENED", opened_before)
+                STATE["orders_today"] += max(0, int(opened_after - opened_before))
             else:
                 log.info("Trading halted (manual) — skipping order placement")
         try:
@@ -359,7 +374,8 @@ def _learn_worker():
         adaptive_allocator.run(base_dir=str(BASE_DIR))
         tg_send(adaptive_allocator.summary_text(base_dir=str(BASE_DIR)))
         STATE["last_learn"] = now_ist().isoformat()
-        log.info(f"Learn step done: {len(trades)} trades ledgered")
+        finals = [t for t in trades if t.get("outcome") != "PARTIAL"]
+        log.info(f"Learn step done: {len(finals)} trades ledgered")
     except Exception as e:
         _record_error(f"learn: {e}")
         tg_send(f"⚠️ Learn step failed: {str(e)[:200]}")
@@ -367,6 +383,15 @@ def _learn_worker():
 # =====================================================================
 # TELEGRAM COMMAND HANDLER
 # =====================================================================
+def _data_provider_label() -> str:
+    try:
+        d = get_dhan()
+        if getattr(d, "is_free_provider", False):
+            return "yahoo_free"
+        return "dhan_hybrid"
+    except Exception:
+        return "yahoo_free"
+
 def _build_status_text() -> str:
     "Human-readable status for Telegram /status command."
     t = now_ist()
@@ -392,6 +417,7 @@ def _build_status_text() -> str:
         f"🤖 <b>BOT STATUS</b> — {t:%d %b %H:%M IST}",
         f"Market open: {'✅' if in_market else '❌'}",
         f"Entry window: {'✅' if in_entry else '❌'}",
+        f"Data feed: {_data_provider_label()}",
         f"Manual halt: {'🛑 YES' if STATE['trading_halted'] else 'no'}",
         f"Auto halt: {'⛔ ' + halt_reason if auto_halt else 'no'}",
         f"Scan running: {'yes' if STATE['scan_running'] else 'no'}",
@@ -421,10 +447,17 @@ def _build_status_text() -> str:
 def telegram_webhook():
     "Handles /status, /report, /pnl, /health, /help, /stop, /resume."
     try:
+        tg_secret = os.getenv("TG_WEBHOOK_SECRET", "").strip()
+        if tg_secret:
+            hdr_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+            if hdr_secret != tg_secret:
+                return jsonify({"ok": False, "error": "unauthorized"}), 401
         update = request.get_json(force=True, silent=True) or {}
         msg = update.get("message") or update.get("edited_message") or {}
         chat = msg.get("chat", {})
         chat_id = str(chat.get("id", ""))
+        from_user = msg.get("from") or {}
+        from_id = str(from_user.get("id", "")) if from_user else ""
         text = (msg.get("text") or "").strip().lower()
         if not chat_id or not text:
             return jsonify({"ok": True})
@@ -432,6 +465,8 @@ def telegram_webhook():
         # /resume (clears the circuit breaker) and /report (leaks positions/P&L) on a
         # public endpoint. Commands now require the chat to be the configured one.
         if not TG_CHAT_ID or chat_id != str(TG_CHAT_ID):
+            return jsonify({"ok": True})
+        if from_id and not str(TG_CHAT_ID).startswith("-") and from_id != str(TG_CHAT_ID):
             return jsonify({"ok": True})
         if not _tg_rate_ok(chat_id):
             return jsonify({"ok": True})
@@ -583,6 +618,7 @@ def status():
         "time_ist":           now_ist().isoformat(),
         "in_market_hours":    MARKET_OPEN <= now_ist().time() <= MARKET_CLOSE,
         "in_entry_window":    SCAN_START <= now_ist().time() <= NO_ENTRY_AFTER,
+        "data_provider":      _data_provider_label(),
         "live_config_active": (BASE_DIR / "live_config.json").exists(),
         "ob_data_active":     (BASE_DIR / "ob_data.csv").exists(),
         "token_hours_left":   token_hours_left,
@@ -679,7 +715,7 @@ def trigger_download():
     def _dl():
         try:
             rc1 = _run_module("csv_downloader.py", [
-                "--mode", "dhan", "--preset", "nifty50",
+                "--mode", "auto", "--preset", "nifty50",
                 "--out", str(DATA_DIR)], timeout=600)
             rc2 = _run_module("precompute_order_blocks.py", [
                 "--csv-dir", str(DATA_DIR),
@@ -687,6 +723,11 @@ def trigger_download():
             rc3 = _run_module("precompute_gapfill.py", [
                 "--csv-dir", str(DATA_DIR),
                 "--out", str(BASE_DIR / "gap_data.csv")], timeout=300)
+            try:
+                import multi_strategy_live as msl
+                msl.reload_tables()
+            except Exception:
+                pass
             STATE["last_download"] = now_ist().isoformat()
             if rc1 != 0 or rc2 != 0 or rc3 != 0:
                 tg_send(f"⚠️ Data pipeline: dl_rc={rc1}, ob_rc={rc2}, gap_rc={rc3}")

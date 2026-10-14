@@ -289,6 +289,7 @@ def _synth_backtest(bars: dict, char: dict, nifty_trend_map: dict,
                 continue
 
             # Walk forward day_df from entry_idx+1 to resolve
+            open_pos[sym] = True
             outcome, exit_px = "SQUAREOFF", float(day_df.iloc[-1]["close"])
             for j in range(entry_idx + 1, len(day_df)):
                 r = _simulate_bar(day_df.iloc[j], entry_px, sl, tgt, side)
